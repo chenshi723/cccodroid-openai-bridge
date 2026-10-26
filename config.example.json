@@ -1,0 +1,6 @@
+{
+  "endpoint": "https://api.example.com/v1/chat/completions",
+  "apiKey": "REPLACE_WITH_YOUR_OWN_UPSTREAM_API_KEY",
+  "model": "REPLACE_WITH_YOUR_OWN_MODEL",
+  "port": 3459
+}

@@ -1,0 +1,106 @@
+#!/usr/bin/env node
+// 完整联网依赖安装测试：只访问 npm 和本机假上游，HOME/设置/端口全部隔离。
+'use strict';
+const fs=require('node:fs');
+const path=require('node:path');
+const os=require('node:os');
+const http=require('node:http');
+const net=require('node:net');
+const {spawn}=require('node:child_process');
+const assert=require('node:assert/strict');
+const kit=process.env.OPENAI_BRIDGE_TEST_SOURCE?path.resolve(process.env.OPENAI_BRIDGE_TEST_SOURCE):path.resolve(__dirname,'..');
+const bundled=process.argv.includes('--bundled');
+function exec(args,opts={}){
+  if(bundled){
+    const [action,...rest]=args;
+    return command(process.execPath,[path.join(kit,'component.cjs'),action==='install'?'configure':action,...rest],opts);
+  }
+  return command(process.execPath,[path.join(kit,'installer.cjs'),...args],opts);
+}
+function command(bin,args,opts={}){
+  return new Promise((resolve,reject)=>{
+    const p=spawn(bin,args,{env:process.env,...opts});
+    let stdout='',stderr='';
+    p.stdout.on('data',b=>stdout+=b);p.stderr.on('data',b=>stderr+=b);
+    const timer=setTimeout(()=>{p.kill('SIGKILL');reject(Error('installer timed out'));},360000);
+    p.on('error',reject);p.on('close',status=>{clearTimeout(timer);resolve({status,stdout,stderr});});
+  });
+}
+const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',()=>resolve(server.address().port));});
+(async()=>{
+  const sourceCli=path.join(kit,'node_modules/@musistudio/claude-code-router/dist/cli.js');
+  const sourceBytes=fs.readFileSync(sourceCli),sourceStat=fs.statSync(sourceCli);
+  const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'kit-e2e-'));
+  const target=path.join(tmp,"bridge with quote's");
+  const settings=path.join(tmp,'settings.json');
+  const cfg=path.join(tmp,'private-config.json');
+  const original={env:{KEEP:'value'},hooks:{SessionStart:[{matcher:'startup',hooks:[{type:'command',command:'printf keep-existing'}]}],Stop:[{hooks:[{type:'command',command:'printf keep-stop'}]}]}};
+  fs.writeFileSync(settings,JSON.stringify(original));
+  const upstream=http.createServer((req,res)=>{
+    let data='';req.on('data',b=>data+=b);req.on('end',()=>{
+      const body=JSON.parse(data);
+      assert.equal(body.model,'test-model');
+      assert.equal(req.headers.authorization,'Bearer test-upstream-only');
+      const result={id:'test-id',model:'test-model',choices:[{index:0,message:{role:'assistant',content:'KIT_LOCAL_TEST_OK'},finish_reason:'stop'}],usage:{prompt_tokens:2,completion_tokens:3}};
+      res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(result));
+    });
+  });
+  let installed=false;
+  try{
+    const upPort=await listen(upstream);
+    const probe=net.createServer(),port=await listen(probe);await new Promise(r=>probe.close(r));
+    fs.writeFileSync(cfg,JSON.stringify({endpoint:`http://127.0.0.1:${upPort}/v1/chat/completions`,apiKey:'test-upstream-only',model:'test-model',port}),{mode:0o600});
+    let r=await exec(['install','--dir',target,'--settings',settings,'--config',cfg,'--yes','--start']);
+    assert.equal(r.status,0,r.stdout+'\n'+r.stderr);installed=true;
+    assert(!r.stdout.includes('test-upstream-only'));
+    console.log('PASS fresh '+(bundled?'bundled offline-copy':'npm-ci')+' install, patch, hook and startup with spaces/apostrophe in path');
+    const connection=JSON.parse(fs.readFileSync(path.join(target,'connection.json')));
+    assert.equal(connection.model,'test-model');assert(connection.apiKey.length>=40);
+    assert(!r.stdout.includes(connection.apiKey));
+    const state=path.join(target,'runtime-home','.claude-code-router');
+    const config=JSON.parse(fs.readFileSync(path.join(state,'config.json')));
+    assert.equal(config.Providers[0].api_key,'test-upstream-only');
+    assert.equal(fs.statSync(path.join(state,'config.json')).mode&0o777,0o600);
+    assert.equal(fs.statSync(path.join(target,'connection.json')).mode&0o777,0o600);
+    const merged=JSON.parse(fs.readFileSync(settings));
+    assert.deepEqual(merged.env,original.env);assert.deepEqual(merged.hooks.Stop,original.hooks.Stop);
+    assert.deepEqual(merged.hooks.SessionStart[0],original.hooks.SessionStart[0]);
+    assert.equal(merged.hooks.SessionStart.length,2);
+    console.log('PASS private generated key/config, unrelated settings preserved');
+    const response=await fetch(connection.baseUrl+'/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':connection.apiKey},body:JSON.stringify({model:'test-model',max_tokens:32,stream:true,messages:[{role:'user',content:'local test'}]})});
+    const body=await response.text();
+    assert.equal(response.status,200,body);assert(body.includes('KIT_LOCAL_TEST_OK'),body);assert(body.includes('message_stop'));
+    console.log('PASS installed real bridge routes local upstream JSON into client SSE');
+    const before=fs.readFileSync(path.join(state,'.claude-code-router.pid'),'utf8');
+    r=await exec(['install','--dir',target,'--settings',settings,'--yes','--start']);
+    assert.equal(r.status,0,r.stderr);assert.deepEqual(JSON.parse(fs.readFileSync(settings)),merged);
+    assert.equal(fs.readFileSync(path.join(state,'.claude-code-router.pid'),'utf8'),before);
+    console.log('PASS repeat install is idempotent and does not restart bridge');
+    r=await command('bash',[path.join(target,'status.sh')]);assert.equal(r.status,0,r.stderr);assert(r.stdout.includes('正常'));assert(!r.stdout.includes(connection.apiKey));
+    console.log('PASS installed status wrapper works and keeps keys hidden');
+    r=await exec(['install','--dir',target,'--settings',settings,'--config',cfg,'--yes']);assert.notEqual(r.status,0);assert(r.stderr.includes('不会覆盖'));
+    fs.appendFileSync(path.join(target,'start-bridge.sh'),'\n# user edit\n');
+    r=await exec(['install','--dir',target,'--settings',settings,'--yes']);assert.notEqual(r.status,0);assert(r.stderr.includes('被修改'));
+    console.log('PASS installer rejects configuration overwrite and modified scripts');
+    r=await command('bash',[path.join(target,'uninstall.sh'),'--yes']);
+    assert.equal(r.status,0,r.stderr);installed=false;
+    assert.deepEqual(JSON.parse(fs.readFileSync(settings)),original);
+    assert(fs.existsSync(path.join(target,'connection.json')));
+    const health=await fetch(connection.baseUrl+'/health').then(()=>true,()=>false);assert.equal(health,false);
+    console.log('PASS uninstall stops only isolated runtime, removes own hook, preserves data');
+    const unknown=path.join(tmp,'not-owned');fs.mkdirSync(unknown);fs.writeFileSync(path.join(unknown,'keep'),'user-data');
+    r=await exec(['install','--dir',unknown,'--settings',settings,'--config',cfg,'--yes']);assert.notEqual(r.status,0);assert(r.stderr.includes('不是由本安装器'),r.stderr);
+    assert.equal(fs.readFileSync(path.join(unknown,'keep'),'utf8'),'user-data');
+    console.log('PASS non-owned directory is not overwritten');
+    assert.deepEqual(fs.readFileSync(sourceCli),sourceBytes);
+    assert.equal(fs.statSync(sourceCli).ino,sourceStat.ino);
+    assert.equal(fs.statSync(sourceCli).mtimeMs,sourceStat.mtimeMs);
+    console.log('PASS source dependency bytes, inode and mtime remain unchanged');
+    console.log('PASS all installer end-to-end checks');
+  }finally{
+    if(installed){const r=await exec(['stop','--dir',target,'--yes']);if(r.status!==0)console.error('cleanup stop failed:',r.stderr);}
+    await new Promise(r=>upstream.close(r));
+    // 所有进程已停止，清理只属于本测试的临时目录。
+    fs.rmSync(tmp,{recursive:true,force:true});
+  }
+})().catch(e=>{console.error(e);process.exitCode=1;});

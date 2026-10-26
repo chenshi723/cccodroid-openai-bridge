@@ -1,0 +1,11 @@
+cccodroid OpenAI API Bridge
+
+Original Android compatibility work and device testing: chenshi723 and contributors.
+
+This bridge integrates the separate MIT-licensed @musistudio/claude-code-router
+1.0.73 project by musistudio. CCR and the OpenAI API were not authored by this
+repository's contributors. CCR's license is retained in LICENSE-CCR.txt; npm
+dependencies retain their own license notices.
+
+No API keys, Claude subscription credentials, private service addresses,
+conversation histories, logs or model quota are included in this repository.

@@ -1,0 +1,2 @@
+#!{{PREFIX}}/bin/sh
+exec "{{PREFIX}}/bin/node" "{{PREFIX}}/lib/openai-bridge/component.cjs" "$@"

@@ -1,0 +1,23 @@
+name: isolated-tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+      - run: npm test
+        env:
+          TMPDIR: ${{ runner.temp }}
+      - name: Known dependency advisories (non-gating; preview only)
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true

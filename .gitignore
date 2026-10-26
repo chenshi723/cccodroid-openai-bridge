@@ -1,0 +1,12 @@
+node_modules/
+*.out
+*.log
+.env
+.env.*
+connection.json
+config.private.json
+.ccr-key
+__pycache__/
+*.pyc
+work/
+dist/
