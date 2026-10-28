@@ -11,7 +11,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
-const { randomUUID } = require("node:crypto");
+const { randomUUID, createHash } = require("node:crypto");
 
 const file = path.join(__dirname, "node_modules/@musistudio/claude-code-router/dist/cli.js");
 
@@ -390,6 +390,75 @@ patch("JSON/SSE response", SSE_MARK, src.includes(SSE_FALLBACK) ? SSE_FALLBACK :
 patch("tool result images", "// ccr-tool-images-v1:", TOOL_IMAGES_OLD, TOOL_IMAGES_NEW);
 patch("image token estimate", "// ccr-image-token-estimate-v1", IMAGE_TOKENS_OLD, IMAGE_TOKENS_NEW);
 
+// 11) npm override 不能修复 CCR 内嵌的 @fastify/static 8.2.0。
+//     校验原代码指纹后整段移除旧实现，改为加载锁文件中的已修复版本；未知 bundle 拒绝写入。
+const staticStart = "// node_modules/.pnpm/@fastify+static@8.2.0/node_modules/@fastify/static/lib/dirList.js";
+const staticEnd = "// node_modules/.pnpm/tiktoken@1.0.22/node_modules/tiktoken/tiktoken_bg.cjs";
+const staticOld = "var import_static = __toESM(require_static());";
+const staticNew = 'var import_static = __toESM(require("@fastify/static"));';
+const staticMark = "// ccr-static-security-v1: external @fastify/static 10.1.2";
+const start = src.indexOf(staticStart), end = src.indexOf(staticEnd, start);
+if (start >= 0) {
+  const digest = createHash("sha256").update(src.slice(start, end)).digest("hex");
+  if (end < start || digest !== "b5cb1364a7a8559c43b8bd66a63ec42f4a120c77500304261efff4e468ff2b5d" || !src.includes(staticOld)) missing.push("bundled static security");
+  else {
+    src = (src.slice(0, start) + staticMark + "\n\n" + src.slice(end)).replace(staticOld, staticNew);
+    changed = true;
+  }
+} else if (!src.includes(staticMark) || !src.includes(staticNew) || /require_(?:static|dirList)\b/.test(src)) missing.push("bundled static security");
+try {
+  const expected = path.join(__dirname, "node_modules/@fastify/static/package.json");
+  const resolved = require.resolve("@fastify/static/package.json", { paths: [path.dirname(file)] });
+  const pkg = JSON.parse(fs.readFileSync(expected, "utf8"));
+  if (resolved !== fs.realpathSync(expected) || pkg.version !== "10.1.2") throw new Error("unexpected static dependency");
+} catch { missing.push("@fastify/static 10.1.2 dependency"); }
+
+// npm audit 不扫描 bundle：这些内嵌 CommonJS 模块也必须移除，不能留旧实现可达。
+const secureModules = {
+  fastify: ["5.12.7", 30, "a0daa8a2e602e73b6e593fc319e13d0564d77ad363146af2b3073410ef8f4828"],
+  ajv: ["8.20.0", 85, "6f63b7ab919bde167534aaa84314fb2fad849e59a76f2ac65ff9786c952fb245"],
+  "fast-uri": ["3.1.9", 3, "8b84c8c51cc1fb8e39d1ae2f2da17b1e318f825d85baa94be728d9b8884f20ca"],
+  "find-my-way": ["9.10.0", 11, "ee4536c482240ab717a64d30fb870a234956aab64eea71d1c79683a41efa4c1b"],
+  undici: ["7.30.1", 103, "30b189bb9f70604d5b06c2df0732b63ed43518f46496c3b0daccb761c104f079"],
+  "@isaacs/brace-expansion": ["5.0.1", 1, "f4fad01984b7b902b68790c287c7b2a4d5e8270c86b203b56bc61fb3e891c537"],
+  minimatch: ["10.2.6", 6, "b6911de12dc7e3b1a58b6f12afd40b7dc3994c7f4bf71937e4f76bdaab5d371d"],
+  glob: ["11.1.0", 7, "fd5227611c0d6aa5a6cc1b48abfb63f4407cc21b311fb75bff10523db30e0d07"],
+  "shell-quote": ["1.12.0", 3, "363b4d666eaea08096b343aaeb5c7c3d6ca6ad7e75f78573eb776cf64f93c10a"]
+};
+for (const [name, [version, count, digest]] of Object.entries(secureModules)) {
+  try {
+    const expected = path.join(__dirname, "node_modules", name, "package.json");
+    const resolved = require.resolve(name + "/package.json", { paths: [path.dirname(file)] });
+    if (resolved !== fs.realpathSync(expected) || JSON.parse(fs.readFileSync(expected, "utf8")).version !== version) throw new Error("version mismatch");
+  } catch { missing.push(name + " " + version + " dependency"); continue; }
+  const blocks = [];
+  for (const match of src.matchAll(/^\/\/ node_modules\/\.pnpm\/[^/]+\/node_modules\/([^\n]+)\nvar (\w+) = __commonJS\(\{/gm)) {
+    if (!match[1].startsWith(name + "/")) continue;
+    const end = src.indexOf("\n});", match.index);
+    if (end < 0) continue;
+    blocks.push({ text: src.slice(match.index, end + 5), subpath: match[1], factory: match[2] });
+  }
+  const mark = "// ccr-bundled-security-v1: " + name + " " + version;
+  if (!blocks.length && src.includes(mark)) continue;
+  if (blocks.length !== count || createHash("sha256").update(blocks.map(block => block.text).join("")).digest("hex") !== digest) {
+    missing.push("bundled security " + name);
+    continue;
+  }
+  for (const block of blocks) {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "node_modules", name, "package.json"), "utf8"));
+    let relative = block.subpath.slice(name.length + 1);
+    if (name === "fastify") relative = relative.replace(/[A-Z]/g, letter => "-" + letter.toLowerCase());
+    if (!fs.existsSync(path.join(__dirname, "node_modules", name, relative))) {
+      missing.push("replacement subpath " + name + "/" + relative);
+      continue;
+    }
+    const specifier = relative === (pkg.main || "index.js").replace(/^\.\//, "") ? JSON.stringify(name) :
+      'require("node:path").join(require.resolve(' + JSON.stringify(name + "/package.json") + '), "..", ' + JSON.stringify(relative) + ')';
+    src = src.replace(block.text, mark + "\nvar " + block.factory + " = () => require(" + specifier + ");");
+  }
+  changed = true;
+}
+
 if (missing.length) {
   console.error("[patch-ccr] 找不到目标代码：" + missing.join(", ") + " —— CCR 版本变了？需要重新对一下 dist/cli.js");
   process.exit(1);
@@ -415,7 +484,7 @@ if (changed) {
     if (fs.existsSync(temp)) fs.unlinkSync(temp);
   }
   if (process.exitCode) process.exit(process.exitCode);
-  console.log("[patch-ccr] patched: " + ["effort", "uncaughtException", "unhandledRejection", "stream reader", "upstream cancel", "error handler", "request body log", "fresh connection", "explicit stream", "JSON/SSE response", "tool result images", "image token estimate"].join(", "));
+  console.log("[patch-ccr] patched: " + ["effort", "uncaughtException", "unhandledRejection", "stream reader", "upstream cancel", "error handler", "request body log", "fresh connection", "explicit stream", "JSON/SSE response", "tool result images", "image token estimate", "bundled static security"].join(", "));
   process.exit(2);   // 刚打上：正在跑的实例还是旧代码，调用方应重启
 }
 console.log("[patch-ccr] already patched");

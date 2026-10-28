@@ -49,6 +49,8 @@ def main():
             base = Path(tmp)
             cli = base / 'node_modules/@musistudio/claude-code-router/dist/cli.js'
             cli.parent.mkdir(parents=True)
+            for name in ['@fastify', '@isaacs', 'fastify', 'ajv', 'fast-uri', 'find-my-way', 'undici', 'minimatch', 'glob', 'shell-quote']:
+                (base / 'node_modules' / name).symlink_to(BR / 'node_modules' / name, target_is_directory=True)
             original = BR / 'node_modules/@musistudio/claude-code-router/dist'
             shutil.copy2(original / 'cli.js', cli)
             shutil.copy2(original / 'tiktoken_bg.wasm', cli.parent / 'tiktoken_bg.wasm')

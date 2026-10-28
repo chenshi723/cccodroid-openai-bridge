@@ -9,8 +9,8 @@
 - 基于 MIT 许可的 `@musistudio/claude-code-router` **1.0.73**，固定依赖和完整性锁文件。
 - 含思考强度映射、上游取消、JSON/SSE 嗅探、工具图片处理、用量保留、原子补丁、单例启动及看护。
 - 本仓库是组件源仓库。通过 `recipe/sync.sh` 将配方和可审查源文件同步到 cccodroid 组件市场；不在仓库提交二进制或 node_modules。
-- **尚未被组件市场收录。** 初始 PR 保持 Draft，等待维护者确认协议适配收录范围、安全风险和发布方式。
-- **固定 CCR 有已知依赖漏洞，见 [SECURITY.md](SECURITY.md)。功能测试通过不代表安全问题已解决。**
+- **尚未被组件市场收录。** 维护者已接受协议适配范围；[PR #53](https://github.com/greyoak111/cccodroid-components/pull/53) 仍保持 Draft，等待 CI 审计及签名安装 → App 聊通 → 干净卸载验证。
+- **1.0.2 修复外部和内嵌依赖：** 静态插件换为 10.1.2、tmp 换为 0.2.7，另移除 249 个受影响内嵌模块并加载锁定修复版；双层审计检查见 [SECURITY.md](SECURITY.md)。这不表示原版 CCR 或所有代码都无漏洞。
 
 ## 运行方式
 
@@ -44,7 +44,9 @@ openai-bridge uninstall --yes
 
 先确认没有需要保留的请求。stop 保留 Hook，新会话会重启；uninstall 停本安装的看护和桥并移除自有 Hook，但保留私有密钥和日志，用户自己决定是否删除。
 
-**在 App 卸载组件前先运行上述 uninstall。** 市场组件卸载只删除包内文件，不会自动结束私有副本或移除 Hook。重复配置保留现有配置，不偷偷迁移、覆盖或自动升级旧运行实例。
+**在 App 卸载组件前先运行上述 uninstall。** 市场组件卸载只删除包内文件，不会自动结束私有副本或移除 Hook。重复配置保留现有配置，不偷偷迁移、覆盖或自动升级旧运行实例；旧版运行副本不会因组件更新自动获得安全修复。
+
+若是可丢弃的验证安装，或已经另行备份并确认永久删除整个专用目录，可执行 `openai-bridge uninstall --yes --purge`。这会连同私有依赖、密钥、配置、日志一起删除，不是默认行为；操作真实数据前必须单独得到用户同意。其他 Claude 设置及其备份不删除。
 
 ## 独立源码安装
 
@@ -62,8 +64,11 @@ node tests/test-installer.cjs
 node tests/test-install-e2e.cjs
 node tests/test-install-e2e.cjs --bundled
 node tests/test-response.cjs
+node tests/test-security.cjs
 python3 tests/test-integration.py
 node runtime/selftest.cjs
+npm audit --omit=dev --audit-level=moderate
+node tests/audit-bundle.cjs
 ```
 
 测试使用临时目录、假配置、随机回环端口，不读用户 Key，不向真实模型发请求，不触碰正在工作的桥。`npm audit --omit=dev` 是另行的安全检查，不是通过条件的替代品；已知报告不能隐藏。
@@ -72,7 +77,7 @@ node runtime/selftest.cjs
 
 ## 向组件市场同步
 
-先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（首版为 1）。初始提案尚未发布。
+先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（当前 1.0.2-r2）。提案尚未发布。
 
 ## 许可与贡献
 

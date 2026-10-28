@@ -100,8 +100,21 @@ test('atomic writes replace complete content with private permissions and no tem
 test('parser accepts supported flags and rejects unknown or missing values',()=>{
   assert.deepEqual(api.parse(['--yes','--start','--port','3459']),{yes:true,start:true,port:'3459'});
   assert.deepEqual(api.parse(['--bundled-runtime','/private/component']),{'bundled-runtime':'/private/component'});
+  assert.deepEqual(api.parse(['--yes','--purge']),{yes:true,purge:true});
   assert.throws(()=>api.parse(['--api-key','secret']));
   assert.throws(()=>api.parse(['--dir']));
+});
+test('purge refuses unowned directories, HOME and symbolic-link targets without deleting data',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kit-purge-'));
+  try{
+    const target=path.join(dir,'owned'),link=path.join(dir,'link');
+    fs.mkdirSync(target);fs.writeFileSync(path.join(target,'keep'),'test-data');
+    assert.throws(()=>api.purgeTarget(target),/本安装器/);
+    assert.throws(()=>api.purgeTarget(os.homedir()));
+    fs.symlinkSync(target,link);
+    assert.throws(()=>api.purgeTarget(link),/符号链接/);
+    assert.equal(fs.readFileSync(path.join(target,'keep'),'utf8'),'test-data');
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
 test('preinstalled dependencies copy privately without symlinking the mutable runtime',()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kit-bundled-'));

@@ -29,6 +29,9 @@ function fixture(name, source) {
   const dir = path.join(root, name);
   const cli = path.join(dir, "node_modules/@musistudio/claude-code-router/dist/cli.js");
   fs.mkdirSync(path.dirname(cli), { recursive: true });
+  for (const name of ["@fastify", "@isaacs", "fastify", "ajv", "fast-uri", "find-my-way", "undici", "minimatch", "glob", "shell-quote"]) {
+    fs.symlinkSync(path.resolve(__dirname, "../node_modules", name), path.join(dir, "node_modules", name), "dir");
+  }
   fs.copyFileSync(cliFile, cli);
   fs.writeFileSync(cli, source);
   fs.copyFileSync(patchFile, path.join(dir, "patch-ccr.js"));
@@ -243,6 +246,37 @@ async function main() {
     assert.equal(fs.readFileSync(copy.cli, "utf8"), source);
     assert.equal(fs.existsSync(copy.cli + ".orig"), false);
     noTemps(copy);
+  });
+
+  await test("Embedded static implementation is removed and the fixed external plugin is selected", () => {
+    assert.ok(patched.includes('var import_static = __toESM(require("@fastify/static"));'));
+    assert.doesNotMatch(patched, /require_(?:static|dirList)\b|@fastify\+static@8\.2\.0/);
+  });
+
+  await test("An altered embedded static implementation fails without writing any file", () => {
+    const source = original.replace('var dirList = require_dirList();', 'var dirList = require_dirList(); // unknown change');
+    assert.notEqual(source, original);
+    const copy = fixture("unknown-static", source);
+    assert.match(apply(copy, 1).stderr, /bundled static security/);
+    assert.equal(fs.readFileSync(copy.cli, "utf8"), source);
+    assert.equal(fs.existsSync(copy.cli + ".orig"), false);
+    noTemps(copy);
+  });
+
+  await test("A missing or outdated external static dependency fails closed", () => {
+    const copy = fixture("outdated-static", original);
+    fs.unlinkSync(path.join(copy.dir, "node_modules/@fastify"));
+    for (const version of [null, "8.3.0"]) {
+      if (version) {
+        const dir = path.join(copy.dir, "node_modules/@fastify/static");
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "@fastify/static", version }));
+      }
+      assert.match(apply(copy, 1).stderr, /@fastify\/static 10\.1\.2 dependency/);
+      assert.equal(fs.readFileSync(copy.cli, "utf8"), original);
+      assert.equal(fs.existsSync(copy.cli + ".orig"), false);
+      noTemps(copy);
+    }
   });
 
   const transformer = extract(patched);

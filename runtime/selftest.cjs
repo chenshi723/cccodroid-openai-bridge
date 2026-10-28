@@ -20,6 +20,9 @@ async function main() {
   try {
     const dist = path.join(temp, "node_modules/@musistudio/claude-code-router/dist");
     fs.mkdirSync(dist, { recursive: true });
+    for (const name of ["@fastify", "@isaacs", "fastify", "ajv", "fast-uri", "find-my-way", "undici", "minimatch", "glob", "shell-quote"]) {
+      fs.symlinkSync(path.join(root, "node_modules", name), path.join(temp, "node_modules", name), "dir");
+    }
     for (const name of ["cli.js", "tiktoken_bg.wasm"]) {
       fs.copyFileSync(path.join(root, "node_modules/@musistudio/claude-code-router/dist", name), path.join(dist, name));
     }
@@ -111,7 +114,7 @@ async function main() {
     }
     fs.rmSync(temp, { recursive: true, force: true });
   }
-  console.log(`===== 总结 ===== CCR=1.0.73 JSON/SSE=${passed}/3 effort=OK upstream=loopback-only`);
+  console.log(`===== 总结 ===== CCR=1.0.73 static=10.1.2 JSON/SSE=${passed}/3 effort=OK upstream=loopback-only`);
 }
 
 main().catch((error) => { console.error("selftest failed:", error.message); process.exitCode = 1; });

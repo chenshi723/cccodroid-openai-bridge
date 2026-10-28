@@ -11,7 +11,7 @@ const {spawnSync} = require('node:child_process');
 const readline = require('node:readline/promises');
 const {Writable} = require('node:stream');
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 const CCR_VERSION = '1.0.73';
 const MARKER = '.ccr-bridge-kit.json';
 const SOURCE = __dirname;
@@ -294,10 +294,18 @@ async function install(options) {
     if(!deployed&&exists(stage))fs.rmSync(stage,{recursive:true,force:true});
   }
 }
+function purgeTarget(target) {
+  if(fs.lstatSync(target).isSymbolicLink() || fs.realpathSync(target)!==target)throw new Error('清理目标或父路径有符号链接，拒绝删除。');
+  if(!target.startsWith(path.resolve(os.homedir())+path.sep) && !target.startsWith(path.resolve(os.tmpdir())+path.sep))throw new Error('清理目标必须位于私有 HOME 或临时目录的专用子目录。');
+  const manifest=loadManifest(target);
+  safeTarget(target,path.resolve(manifest.settings));
+  return target;
+}
 async function confirmStop(target,options) {
   if(options.yes)return;
   if(!process.stdin.isTTY)throw new Error('此操作可能打断请求，需 --yes 或交互确认。');
-  if((await ask('将停止此安装的看护和桥，可能打断请求。输入 yes'))!=='yes')throw new Error('已取消。');
+  const message=options.purge?'将停止此安装并永久删除整个专用目录（含密钥、配置和日志）：'+target+'。输入 yes':'将停止此安装的看护和桥，可能打断请求。输入 yes';
+  if((await ask(message))!=='yes')throw new Error('已取消。');
 }
 function stopManaged(target) {
   // 共享同一身份校验和 service.lock；绝不按名称批量 pkill。
@@ -311,6 +319,10 @@ function stopManaged(target) {
 async function manage(command,options) {
   const target=path.resolve(options.dir||SOURCE);
   const m=loadManifest(target);
+  if(options.purge){
+    if(command!=='uninstall')throw new Error('--purge 只适用于 uninstall。');
+    purgeTarget(target);
+  }
   if(command==='connection'){showConnection(target,options['show-key']);return;}
   if(command==='status'){
     console.log('安装版本：'+m.version+' / CCR '+CCR_VERSION);
@@ -330,9 +342,12 @@ async function manage(command,options) {
   const before=readSettings(m.settings,true);
   const after=removeHook(before,target);
   if(!same(before,after)){if(exists(m.settings))backup(m.settings);atomic(m.settings,JSON.stringify(after,null,2)+'\n');}
-  // 默认保留密钥、日志和安装文件，避免“卸载”误删用户数据。仅删除自有自动启动规则。
   console.log('已停止并移除本安装的钩子，其他配置未动。');
-  console.log('安装目录和密钥保留：'+target+'；如不再需要，请自行确认后删除整个专用目录。');
+  if(options.purge){
+    purgeTarget(target);
+    fs.rmSync(target,{recursive:true});
+    console.log('已删除整个专用安装目录（含依赖、密钥、配置和日志）：'+target);
+  }else console.log('安装目录和密钥保留：'+target+'；如需永久删除，确认备份后使用 uninstall --yes --purge。');
 }
 function parse(argv) {
   const out={};
@@ -340,7 +355,7 @@ function parse(argv) {
     const key=argv[i];
     if(!key.startsWith('--'))throw new Error('未知参数：'+key);
     const name=key.slice(2);
-    if(['yes','start','show-key','help'].includes(name)){out[name]=true;continue;}
+    if(['yes','start','show-key','help','purge'].includes(name)){out[name]=true;continue;}
     if(!['dir','settings','config','port','bundled-runtime'].includes(name)||!argv[i+1]||argv[i+1].startsWith('--'))throw new Error('未知或缺值的参数：'+key);
     out[name]=argv[++i];
   }
@@ -350,9 +365,10 @@ async function main() {
   process.umask(0o077);
   const [cmd='install',...argv]=process.argv.slice(2);
   const options=parse(argv);
-  if(options.help){console.log('用法：bash install.sh [--config 私有JSON] [--port 端口] [--dir 安装目录] [--settings 设置路径] [--yes] [--start]\n管理：node manage.cjs status|start|stop|uninstall|connection --dir 安装目录 [--yes] [--show-key]');return;}
+  if(options.help){console.log('用法：bash install.sh [--config 私有JSON] [--port 端口] [--dir 安装目录] [--settings 设置路径] [--yes] [--start]\n管理：node manage.cjs status|start|stop|uninstall|connection --dir 安装目录 [--yes] [--show-key] [--purge（仅卸载，永久删除专用目录）]');return;}
   if(!COMMANDS.has(cmd))throw new Error('未知操作：'+cmd);
+  if(options.purge&&cmd!=='uninstall')throw new Error('--purge 只适用于 uninstall。');
   if(cmd==='install')await install(options);else await manage(cmd,options);
 }
 if(require.main===module)main().catch(e=>{console.error('错误：'+e.message);process.exitCode=1;});
-module.exports={atomic,mergeHook,removeHook,validateConfig,routerConfig,readSettings,safeTarget,hookEntry,parse,quote,copyBundledRuntime};
+module.exports={atomic,mergeHook,removeHook,validateConfig,routerConfig,readSettings,safeTarget,hookEntry,parse,quote,copyBundledRuntime,purgeTarget};

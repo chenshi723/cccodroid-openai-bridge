@@ -18,6 +18,9 @@ jobs:
       - run: npm test
         env:
           TMPDIR: ${{ runner.temp }}
-      - name: Known dependency advisories (non-gating; preview only)
-        run: npm audit --omit=dev --audit-level=high
-        continue-on-error: true
+      - name: Dependency security gate
+        run: npm audit --omit=dev --audit-level=moderate
+      - name: Effective bundled dependency security gate
+        run: node tests/audit-bundle.cjs
+        env:
+          TMPDIR: ${{ runner.temp }}
