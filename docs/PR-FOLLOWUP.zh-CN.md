@@ -12,7 +12,10 @@
 
 完整版本、修补边界及记录已写进源仓库 `SECURITY.md`、`TESTING.md`。原始 npm 程序和 `.orig` 备份仍是上游原件，不能绕过受管理入口直接运行；也不把 point-in-time 公告归零说成所有代码均无漏洞。
 
-### 2. 仍待官方发布链路验证
+### 2. CI 状态及仍待官方发布链路验证
+
+- 源仓库 GitHub Actions [40617296043](https://github.com/chenshi723/cccodroid-openai-bridge/actions/runs/40617296043) 已 **success**：Ubuntu/Node 22 全套测试、外部依赖门禁、有效内嵌依赖门禁全部通过。
+- 市场本次 PR check [40617306752](https://github.com/greyoak111/cccodroid-components/actions/runs/40617306752) 为 **action_required**，尚无执行 job，仍需维护者批准；不将源码 CI 代替市场审计。
 
 我没有把上述本地归档测试写成“官方签名索引已安装”，也没有填 `verified.json`。App 自定义接口聊通、官方签名索引安装/卸载和市场 hosted CI 报告还会如实补齐；不会用假上游冒充真实模型验证，不上传私人配置或对话。
 
