@@ -42,13 +42,21 @@
 - 最终组件归档另解包到隔离目录，自检及完整配置 → 请求 → 重复安装 → 状态 → 保留数据卸载 → 彻底清理通过，不改 live PREFIX。
 - 自检：`CCR=1.0.73 static=10.1.2 JSON/SSE=3/3 effort=OK upstream=loopback-only`。
 
+补充：设备升级到 `devkit-2026.10.28` / Node 26.12.1 / Python 3.14.8 后，已重新通过同一完整测试集、外部和有效 bundle 审计，以及针对当前 base 新构建归档的 selftest、隔离安装/卸载/purge。未修改现用桥或真实配置。
+
 这些是**隔离本地验证**，不冒充官方签名索引安装或 App 端到端验证。完整记录见源仓库 `TESTING.md`。
+
+## 市场 CI 已通过
+
+- [40617306752 / attempt 2](https://github.com/greyoak111/cccodroid-components/actions/runs/40617306752)：`check`、`audit` success。官方原始日志 **0 错 / 2 警告**；termux-docker selftest `rc=0`、JSON/SSE=3/3、effort=OK。
+- 自动回贴 PR 因 fork token 无 `addComment` 权限失败，不影响最终审计结果。
+- 完整 hosted Summary 未作为 artifact 提供。在同一归档上按原规则本地复现：20 个 foreign shebang（termux-exec 兼容）；旧底座与仓库 Node 版本漂移（26.4.0-2 → 26.12.1，构建仍用固定底座版本）。本地复现不是 hosted Summary 原文，也不替代完整旧底座审计。
+- 官方索引生成于 `2026-10-28T04:44:54.409Z`，按与 App 内置一致的 Ed25519 公钥验签成功，但 **28 个组件里仍无 openai-bridge，官方 Release 也不存在**。
 
 ## 仍待完成 / Merge blockers
 
 1. **官方签名索引安装 → 配置 → App 自定义接口聊通 → 卸载干净。** 当前未完成，不写 `verified.json`。需要维护者确认 Draft 未合并时的可信预发布签名索引/安装方式，或先后验证顺序；不自行替换官方信任根，也不把本地包当签名包。
-2. **市场的 hosted CI 审计及 termux-docker selftest。** 尚待可运行的官方 PR CI，源仓库测试不代替市场审计。
-3. 真实 API 推理需用户自己私下配置并确认内容/费用；本轮没有收费请求，没有上传用户截图、对话、日志或凭据，没有中断现用桥。
+2. 真实 API 推理需用户自己私下配置并确认内容/费用；本轮没有收费请求，没有上传用户截图、对话、日志或凭据，没有中断现用桥。
 
 ## Checklist
 
@@ -60,7 +68,7 @@
 - [x] 安全、停止、清数据、花费和公开发布边界明确
 - [x] `needs` 不需要 root/Shizuku/GPU/显示
 - [x] 维护者已确认本地用户自有 API 协议适配属于允许范围
-- [ ] 已核查市场本次 hosted CI 审计报告
+- [x] 市场 hosted CI 和 termux-docker 自检通过；已读原始日志，两类警告按原规则本地复现（未获取完整 hosted Summary）
 - [ ] 官方签名索引 → App 聊通 → 完整卸载真机验证
 
 AI 辅助整理代码、文档和测试；设备验证在贡献者自己的设备上执行。CCR 引擎及 OpenAI API 不属于本贡献原创。
