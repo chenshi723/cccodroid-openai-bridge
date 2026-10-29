@@ -10,7 +10,7 @@ const api=require('../installer.cjs');
 const target='/private/example/bridge with apostrophe\'s';
 const valid={endpoint:'https://api.example.com/v1/chat/completions',apiKey:'test-only',model:'model-test'};
 
-test('merges exactly one own SessionStart hook without changing other settings',()=>{
+test('merges one scoped own SessionStart hook without changing other settings',()=>{
   const src={env:{CUSTOM:'keep'},permissions:{allow:['Read']},hooks:{SessionStart:[{matcher:'startup',hooks:[{type:'command',command:'printf existing'}]}],Stop:[{hooks:[{type:'command',command:'printf stop'}]}]}};
   const copy=structuredClone(src),out=api.mergeHook(src,target);
   assert.deepEqual(src,copy);
@@ -18,7 +18,18 @@ test('merges exactly one own SessionStart hook without changing other settings',
   assert.deepEqual(out.hooks.Stop,src.hooks.Stop);
   assert.deepEqual(out.hooks.SessionStart[0],src.hooks.SessionStart[0]);
   assert.equal(out.hooks.SessionStart.length,2);
+  const own=out.hooks.SessionStart[1];
+  assert.equal(own.matcher,'startup|resume');
+  assert.equal(own.hooks[0].timeout,20);
+  assert.match(own.hooks[0].command,/start-bridge\.sh' --hook$/);
   assert.deepEqual(api.mergeHook(out,target),out);
+});
+test('migrates the legacy broad hook to the scoped hook',()=>{
+  const legacy={hooks:{SessionStart:[api.legacyHookEntry(target)]}};
+  const out=api.mergeHook(legacy,target);
+  assert.equal(out.hooks.SessionStart.length,1);
+  assert.equal(out.hooks.SessionStart[0].matcher,'startup|resume');
+  assert.match(out.hooks.SessionStart[0].hooks[0].command,/ --hook$/);
 });
 test('uninstall restores semantic settings and preserves user hooks',()=>{
   const src={env:{CUSTOM:'keep'},hooks:{SessionStart:[{hooks:[{type:'command',command:'printf existing'}]}]}};

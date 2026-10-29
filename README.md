@@ -10,7 +10,8 @@
 - 含思考强度映射、上游取消、JSON/SSE 嗅探、工具图片处理、用量保留、原子补丁、单例启动及看护。
 - 本仓库是组件源仓库。通过 `recipe/sync.sh` 将配方和可审查源文件同步到 cccodroid 组件市场；不在仓库提交二进制或 node_modules。
 - **尚未被组件市场收录。** 维护者已接受协议适配范围；[PR #53](https://github.com/greyoak111/cccodroid-components/pull/53) 仍保持 Draft，等待 CI 审计及签名安装 → App 聊通 → 干净卸载验证。
-- **1.0.2 修复外部和内嵌依赖：** 静态插件换为 10.1.2、tmp 换为 0.2.7，另移除 249 个受影响内嵌模块并加载锁定修复版；双层审计检查见 [SECURITY.md](SECURITY.md)。这不表示原版 CCR 或所有代码都无漏洞。
+- **1.0.3 修复 Hook 生命周期：** SessionStart 仅匹配 `startup|resume`，并只在 `ANTHROPIC_BASE_URL` 指向本桥时异步拉起看护；App 移除组件后私有副本会拒绝自启并记录清理提示。
+- **1.0.2 安全整改仍包含：** 静态插件换为 10.1.2、tmp 换为 0.2.7，另移除 249 个受影响内嵌模块并加载锁定修复版；双层审计检查见 [SECURITY.md](SECURITY.md)。这不表示原版 CCR 或所有代码都无漏洞。
 
 ## 运行方式
 
@@ -31,6 +32,8 @@
 2. **用户自己**在终端运行 `openai-bridge configure`，输入完整 Chat Completions URL、自有 API Key 和模型名；密钥不回显。不支持 Responses API。
 3. 确认新增 SessionStart Hook。运行 `openai-bridge start` 启动，`openai-bridge status` 查看不含密钥的状态。
 4. 在 App 设置的「自定义接口」手动填入配置完成时显示的本机地址、模型以及私有连接文件中的本地密钥。不要把远端 Key 当成本地 Key，不要把连接文件发给 AI 或公开。
+
+组件归档解开约 **107 MiB**；首次配置还会在专用目录复制约 **98 MiB** 私有运行副本。
 5. 组件不会自动改写 App 的供应商列表，也不自动切换正在用的供应商。**此提案没有实现专用图形配置卡片**；若上游希望在 App 内直接填 OpenAI URL/Key/模型，可在确认范围后另开主应用 PR。
 
 运行目录默认是当前 HOME 下 `.local/share/ccr-bridge-kit`，与组件管理器拥有的 `$PREFIX/lib/openai-bridge` 分开。补丁只修改私有运行副本，组件安装目录保持原样。已有手工桥、原 `.claude-code-router`、现有 Hooks 和 Claude 账户凭据不被覆盖。
@@ -77,7 +80,7 @@ node tests/audit-bundle.cjs
 
 ## 向组件市场同步
 
-先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（当前 1.0.2-r2）。提案尚未发布。
+先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（当前 1.0.3-r3）。提案尚未发布。
 
 ## 许可与贡献
 

@@ -1,6 +1,6 @@
 ## 组件 / Component
 
-- id: `openai-bridge`（`1.0.2-r2`，预览）
+- id: `openai-bridge`（`1.0.3-r3`，预览）
 - 源仓库 / Source: https://github.com/chenshi723/cccodroid-openai-bridge
 - 协议转换：固定 `@musistudio/claude-code-router` **1.0.73**，MIT；本次另锁定安全修复依赖，并移除私有运行副本中的旧内嵌实现。
 - 配方/文档按市场 Apache-2.0 规范提交；桥接脚本 MIT，保留依赖许可证和原作者信息。
@@ -25,16 +25,17 @@
 
 - 保留 effort 映射、取消上游、JSON/SSE 嗅探、工具图片转换、本地图片估算和日志级别修复。
 - 配置使用终端私下输入，现有 App「自定义接口」连接本机；不索要、读取或打印用户密钥，不自动切换供应商。
+- SessionStart Hook 仅匹配 `startup|resume`，并以 `--hook` 模式检查 `ANTHROPIC_BASE_URL`；非本桥会话立即跳过，匹配时只异步拉起看护，不占满 65 秒等待。manifest 记录组件入口，App 移除组件后私有副本拒绝自启并提示清理。
 - 默认 `openai-bridge uninstall --yes` 停服务并移除自有 Hook，保留数据；额外显式 `--purge` 才彻底删除专用目录及私有依赖、密钥、日志。真实数据 purge 前单独确认和备份，不能把普通卸载授权当删除授权。
 - 旧运行副本不自动升级；主应用只卸包不会自动清私有副本，后续集成另谈。
-- 本地构建约 **26.96 MiB gzip / 106.78 MiB tar**（28,264,960 / 111,963,648 字节）；**182 个 npm 包**随组件提供，位于私有命名空间，底座之外额外 Termux 包 **0**。首次配置另复制私有运行副本。
-- 源仓库 `recipe/sync.sh` 同步，revision 已从 1 增为 2。
+- 本地构建约 **26.96 MiB gzip / 106.78 MiB tar**（28,264,960 / 111,963,648 字节）；**182 个 npm 包**随组件提供，位于私有命名空间，底座之外额外 Termux 包 **0**。首次配置另复制约 98 MiB 私有运行副本。
+- 源仓库 `recipe/sync.sh` 同步，revision 已从 2 增为 3。
 
 ## 已完成的本机检查
 
 设备：Xiaomi M367FC（Xiaomi Pad 9 Pro Max），Android 17 / SDK 37，aarch64，XRing O3 / Mali；普通应用 UID 原生运行，Node 26.4.0、Python 3.14，无 root/Shizuku/chroot/proot。构建基线 `devkit-2026.10.22.3`。
 
-- 16 项安装器单测；独立 npm 安装与组件预装依赖两条完整生命周期（含显式 purge），其他 Hook 与源依赖字节/inode/mtime 保持不变。
+- 17 项安装器单测；独立 npm 安装与组件预装依赖两条完整生命周期（含 scoped Hook、foreign base 跳过、卸载后自启阻断和显式 purge），其他 Hook 与源依赖字节/inode/mtime 保持不变。
 - 76 项请求/响应/原子补丁回归，9 项真实 CCR + 回环假上游 HTTP 测试，健康探测正反例和超时测试。
 - 真 bundle 的安全模块加载身份、静态路径安全及 tmp 越界回归。
 - 外部 audit=0；有效运行 bundle 84 个内嵌包，中危及以上匹配=0。

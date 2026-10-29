@@ -66,7 +66,15 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert.deepEqual(merged.env,original.env);assert.deepEqual(merged.hooks.Stop,original.hooks.Stop);
     assert.deepEqual(merged.hooks.SessionStart[0],original.hooks.SessionStart[0]);
     assert.equal(merged.hooks.SessionStart.length,2);
+    assert.equal(merged.hooks.SessionStart[1].matcher,'startup|resume');
+    assert.match(merged.hooks.SessionStart[1].hooks[0].command,/start-bridge\.sh' --hook$/);
     console.log('PASS private generated key/config, unrelated settings preserved');
+    const foreignPid=fs.readFileSync(path.join(state,'.claude-code-router.pid'),'utf8');
+    const foreign=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:'http://127.0.0.1:39999/v1/messages'}});
+    assert.equal(foreign.status,0,foreign.stderr);
+    assert.equal(fs.readFileSync(path.join(state,'.claude-code-router.pid'),'utf8'),foreignPid);
+    assert.equal(await fetch(connection.baseUrl+'/health').then(()=>true,()=>false),true);
+    console.log('PASS foreign Anthropic base URL skips hook without restarting bridge');
     const response=await fetch(connection.baseUrl+'/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':connection.apiKey},body:JSON.stringify({model:'test-model',max_tokens:32,stream:true,messages:[{role:'user',content:'local test'}]})});
     const body=await response.text();
     assert.equal(response.status,200,body);assert(body.includes('KIT_LOCAL_TEST_OK'),body);assert(body.includes('message_stop'));
@@ -88,6 +96,18 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert(fs.existsSync(path.join(target,'connection.json')));
     const health=await fetch(connection.baseUrl+'/health').then(()=>true,()=>false);assert.equal(health,false);
     console.log('PASS uninstall stops only isolated runtime, removes own hook, preserves data');
+    // Simulate App removing the component entry while leaving the private runtime and Hook.
+    const manifest=JSON.parse(fs.readFileSync(path.join(target,'.ccr-bridge-kit.json')));
+    const componentEntry=path.join(kit,'component.cjs'), removedEntry=componentEntry+'.removed-for-test';
+    assert.equal(manifest.componentEntry,componentEntry);
+    fs.renameSync(componentEntry,removedEntry);
+    try{
+      r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:connection.baseUrl}});
+      assert.equal(r.status,0,r.stdout+'\n'+r.stderr);
+      assert.match(r.stderr+r.stdout,/组件已卸载|入口不存在/);
+      assert.equal(await fetch(connection.baseUrl+'/health').then(()=>true,()=>false),false);
+    }finally{fs.renameSync(removedEntry,componentEntry);}
+    console.log('PASS removed component entry prevents private runtime auto-start and logs cleanup hint');
     r=await exec(['uninstall','--dir',target,'--yes','--purge']);
     assert.equal(r.status,0,r.stdout+'\n'+r.stderr);
     assert.equal(fs.existsSync(target),false);

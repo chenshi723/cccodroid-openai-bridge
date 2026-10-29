@@ -42,6 +42,16 @@ The source CI now **fails** on medium/high/critical external or effective-bundle
 - A fresh component build targeting that current base has 7343 files / 182 npm packages and no additional Termux packages. Gzip: **28,264,960 bytes**, SHA-256 `7775c9367a5d9c0360c3a4944797993f6eb95243842e325ff8502d3d56c6b5fb`; payload tar: **111,963,648 bytes**, SHA-256 `df6240db0f34bc252401c585579e5b770fabcf521374362046636066f61c71ba`. Its immutable payload is byte-identical to the prior build; its metadata identifies the new compatible base. Extracted selftest and bundled lifecycle, including preserve-data uninstall followed by explicit disposable-directory purge, passed again.
 - The official market index generated at `2026-10-28T04:44:54.409Z` was downloaded and **verified with the same Ed25519 public key embedded in the installed App**. It contains 28 components, but **no `openai-bridge`**; there is no official `openai-bridge` Release either. Consequently a signed-index installation cannot yet be attempted. No unsigned override, alternate trust root, live provider switch or real inference request was used.
 
+## Hook lifecycle follow-up — 1.0.3-r3
+
+Maintainer feedback requested two changes before promotion. They are implemented locally but not yet pushed:
+
+- `SessionStart` is now `matcher: startup|resume`, uses `start-bridge.sh --hook` with a 20-second hook timeout, exits for non-matching `ANTHROPIC_BASE_URL`, and only asynchronously starts the watchdog instead of waiting through the 65-second readiness deadline.
+- The private manifest records the component entry. If that entry is absent after App component removal, the leftover Hook logs a cleanup hint and exits without starting CCR.
+- The package description states the approximately 107 MiB tar payload; the scoped lifecycle tests cover legacy-Hook migration, foreign-provider skip, removed-entry auto-start blocking and explicit purge.
+
+The implementation has passed 17 installer unit checks, both standalone/bundled lifecycle modes, health checks and the full 1.0.3 test suite in the isolated source workspace. It is a Draft follow-up only; no current bridge was restarted and no real credentials or provider request were used.
+
 ## Not completed or claimed
 
 - Official signed-index installation/removal through the App component manager and a current in-App chat have not been completed. A locally extracted package is **not** a signed-index install. No `verified.json` record is added.

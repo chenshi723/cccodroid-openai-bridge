@@ -37,6 +37,12 @@ Local checks on 2026-10-28: external npm audit **0 vulnerabilities**; the effect
 
 The component manager's immutable CCR source and private `.orig` backup still contain upstream's old bundle. **Do not run the bundled `ccr` CLI directly**: only `openai-bridge` and the managed start scripts apply these remediations. We do not claim that the original npm release or every file in the download is fixed. No debug UI or public server is needed by this component. New upstream versions require re-auditing and new fingerprints; do not force-upgrade CCR underneath these patches.
 
+## Hook and component lifecycle boundaries in 1.0.3
+
+- The user-level `SessionStart` entry is limited to `startup|resume` and invokes `start-bridge.sh --hook` with a 20-second hook timeout. The script exits immediately unless `ANTHROPIC_BASE_URL` starts with this installation's loopback endpoint; matching hook calls only ensure the watchdog is running and do not wait up to the full readiness deadline. Other providers, official accounts, scheduled sessions, `clear` and `compact` are not made to wait for this bridge.
+- The private manifest records the component package's `component.cjs` entry. If the App removes the component package but leaves the private runtime and user Hook, the entry check writes a cleanup hint and exits without starting CCR. It does not delete user data automatically.
+- Existing 1.0.2 private runtimes are not silently migrated or patched by a component update. Reconfigure after uninstalling an old runtime if you need the 1.0.3 Hook boundary; the old runtime's own manager remains available for an explicit stop/uninstall.
+
 ## Release and cleanup boundaries
 
 The official signed-index/App install → configuration → in-app chat → complete uninstall and the market's hosted audit review remain separate requirements. Passing isolated tests does not satisfy them. No `verified.json` entry is generated from a local archive.

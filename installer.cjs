@@ -11,7 +11,7 @@ const {spawnSync} = require('node:child_process');
 const readline = require('node:readline/promises');
 const {Writable} = require('node:stream');
 
-const VERSION = '1.0.2';
+const VERSION = '1.0.3';
 const CCR_VERSION = '1.0.73';
 const MARKER = '.ccr-bridge-kit.json';
 const SOURCE = __dirname;
@@ -75,26 +75,46 @@ function readSettings(file,allowDisabled=false) {
   return value;
 }
 function hookEntry(target) {
+  return {matcher:'startup|resume',hooks:[{type:'command',command:'bash '+quote(path.join(target,'start-bridge.sh'))+' --hook',timeout:20}]};
+}
+function legacyHookEntry(target) {
   return {hooks:[{type:'command',command:'bash '+quote(path.join(target,'start-bridge.sh')),timeout:120}]};
 }
 function mergeHook(settings,target) {
   const result=structuredClone(settings);
   result.hooks??={};
   result.hooks.SessionStart??=[];
-  const entry=hookEntry(target);
-  const command=entry.hooks[0].command;
-  const found=result.hooks.SessionStart.flatMap(g=>Array.isArray(g?.hooks)?g.hooks:[]).filter(h=>h?.command===command);
-  if(found.length && !found.every(h=>same(h,entry.hooks[0])))throw new Error('已有同路径 hook 被定制，拒绝覆盖。');
-  if(!found.length)result.hooks.SessionStart.push(entry);
+  const entry=hookEntry(target), expected=entry.hooks[0], legacy=legacyHookEntry(target).hooks[0];
+  let current=false, old=false;
+  for(const group of result.hooks.SessionStart){
+    for(const hook of Array.isArray(group?.hooks)?group.hooks:[]){
+      if(hook?.command===expected.command){
+        if(!same(hook,expected)||group?.matcher!==entry.matcher)throw new Error('已有同路径 hook 被定制，拒绝覆盖。');
+        current=true;
+      }else if(hook?.command===legacy.command){
+        if(!same(hook,legacy))throw new Error('已有同路径 hook 被定制，拒绝覆盖。');
+        old=true;
+      }
+    }
+  }
+  if(old || current){
+    result.hooks.SessionStart=result.hooks.SessionStart.flatMap(g=>{
+      if(!Array.isArray(g?.hooks))return [g];
+      const hooks=g.hooks.filter(h=>h?.command!==legacy.command&&h?.command!==expected.command);
+      if(hooks.length===g.hooks.length)return [g];
+      return hooks.length?[{...g,hooks}]:[];
+    });
+  }
+  result.hooks.SessionStart.push(entry);
   return result;
 }
 function removeHook(settings,target) {
   const result=structuredClone(settings);
   if(!result.hooks?.SessionStart)return result;
-  const expected=hookEntry(target).hooks[0];
+  const expected=hookEntry(target).hooks[0], legacy=legacyHookEntry(target).hooks[0];
   result.hooks.SessionStart=result.hooks.SessionStart.flatMap(g=>{
     if(!Array.isArray(g?.hooks))return [g];
-    const hooks=g.hooks.filter(h=>!same(h,expected));
+    const hooks=g.hooks.filter(h=>!same(h,expected)&&!same(h,legacy));
     if(hooks.length===g.hooks.length)return [g];
     return hooks.length?[{...g,hooks}]:[];
   });
@@ -252,6 +272,7 @@ async function install(options) {
   try{
     for(const name of RUNTIME_FILES)fs.copyFileSync(path.join(SOURCE,'runtime',name),path.join(stage,name));
     for(const name of ['package.json','package-lock.json'])fs.copyFileSync(path.join(SOURCE,name),path.join(stage,name));
+    fs.copyFileSync(path.join(SOURCE,'component.cjs'),path.join(stage,'component.cjs'));
     fs.copyFileSync(__filename,path.join(stage,'manage.cjs'));
     for(const [file,cmd] of [['stop.sh','stop'],['uninstall.sh','uninstall'],['status.sh','status']])atomic(path.join(stage,file),wrapper(target,cmd),0o700);
     for(const name of ['LICENSE-CCR.txt','LICENSE','README.md'])if(exists(path.join(SOURCE,name)))fs.copyFileSync(path.join(SOURCE,name),path.join(stage,name));
@@ -271,14 +292,14 @@ async function install(options) {
     atomic(path.join(state,'config.json'),JSON.stringify(routerConfig(config,port,localKey),null,2)+'\n');
     atomic(path.join(stage,'connection.json'),JSON.stringify({baseUrl:'http://127.0.0.1:'+port,apiKey:localKey,model:config.model},null,2)+'\n');
     const files={};
-    for(const name of [...RUNTIME_FILES,'manage.cjs','stop.sh','uninstall.sh','status.sh','package.json','package-lock.json','port']){
+    for(const name of [...RUNTIME_FILES,'component.cjs','manage.cjs','stop.sh','uninstall.sh','status.sh','package.json','package-lock.json','port']){
       const p=path.join(stage,name);fs.chmodSync(p,name.endsWith('.sh')?0o700:0o600);files[name]=sha(fs.readFileSync(p));
     }
     const current=readSettings(settings);
     if(!same(current,original))throw new Error('安装期间 Claude 设置被其他程序修改，已停止，未覆盖。');
     const merged=mergeHook(current,target);
     const saved=exists(settings)?backup(settings):null;
-    atomic(path.join(stage,MARKER),JSON.stringify({id:'ccr-bridge-kit',version:VERSION,target,settings,settingsBackup:saved,hook:hookEntry(target),files},null,2)+'\n');
+    atomic(path.join(stage,MARKER),JSON.stringify({id:'ccr-bridge-kit',version:VERSION,target,settings,settingsBackup:saved,componentEntry:path.join(SOURCE,'component.cjs'),hook:hookEntry(target),files},null,2)+'\n');
     fs.renameSync(stage,target);deployed=true;
     try{atomic(settings,JSON.stringify(merged,null,2)+'\n');}
     catch(e){throw new Error('安装文件已保留，但钩子写入失败；修正权限后重新执行安装器即可。'+e.message);}
@@ -371,4 +392,4 @@ async function main() {
   if(cmd==='install')await install(options);else await manage(cmd,options);
 }
 if(require.main===module)main().catch(e=>{console.error('错误：'+e.message);process.exitCode=1;});
-module.exports={atomic,mergeHook,removeHook,validateConfig,routerConfig,readSettings,safeTarget,hookEntry,parse,quote,copyBundledRuntime,purgeTarget};
+module.exports={atomic,mergeHook,removeHook,validateConfig,routerConfig,readSettings,safeTarget,hookEntry,legacyHookEntry,parse,quote,copyBundledRuntime,purgeTarget};
