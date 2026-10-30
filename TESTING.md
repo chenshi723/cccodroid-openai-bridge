@@ -44,7 +44,7 @@ The source CI now **fails** on medium/high/critical external or effective-bundle
 
 ## Hook lifecycle follow-up — 1.0.3-r3
 
-Maintainer feedback requested two changes before promotion. They are implemented locally but not yet pushed:
+Historical 1.0.3-r3 was pushed for the maintainer feedback; the strengthened 1.0.4-r4 follow-up below supersedes its endpoint and watchdog boundaries.
 
 - `SessionStart` is now `matcher: startup|resume`, uses `start-bridge.sh --hook` with a 20-second hook timeout, exits for non-matching `ANTHROPIC_BASE_URL`, and only asynchronously starts the watchdog instead of waiting through the 65-second readiness deadline.
 - The private manifest records the component entry. If that entry is absent after App component removal, the leftover Hook logs a cleanup hint and exits without starting CCR.
@@ -52,10 +52,25 @@ Maintainer feedback requested two changes before promotion. They are implemented
 
 The implementation has passed 17 installer unit checks, both standalone/bundled lifecycle modes, health checks and the full 1.0.3 test suite in the isolated source workspace. It is a Draft follow-up only; no current bridge was restarted and no real credentials or provider request were used.
 
+## Hook boundary and release handoff — 2026-10-30, 1.0.4-r4
+
+The maintainer confirmed on October 29 that the official order is **merge → CI package/sign → signed-index install, in-App chat and complete uninstall → separate verified.json**. No pre-release signed index is requested; timing and merge belong to the maintainer. The prior follow-up incorrectly repeated that request after it had been answered; current PR text corrects it.
+
+- Strict base-URL/port matching occurs before Node, HOME changes, log writes, dependency checks or locks. Exact loopback authority and paths beneath it are accepted; prefix ports/userinfo/foreign hosts are not. Matching Hooks only dispatch the single-instance watchdog, leaving patch/lock/readiness work to the background.
+- Hook/manual/direct-watchdog entry checks validate this installation's manifest and the external component-package entry. An already-running watchdog checks every iteration and again after patch verification; it exits on removal without killing the active CCR. Private uninstall.sh remains usable after component removal.
+- Corrected the accidental @protobufjs/float version metadata change from 1.0.3 back to its unchanged resolved/integrity artifact version 1.0.2; no dependency artifact is upgraded by that correction.
+- Clean npm ci followed by npm test passed: **17 installer unit checks, 9 new isolated Hook checks, 76 response/atomic regressions, 9 real-CCR HTTP tests**, both standalone/bundled lifecycles, health checks and selftest 3/3. External npm audit reports **0 vulnerabilities**; effective bundle audit checks **84 remaining embedded packages, 0 medium/high/critical advisory matches**.
+- New Hook checks cover no-Node foreign/empty URL skips, strict port/userinfo/host boundaries, delayed patch cold-start return, /v1 paths and concurrent singletons, busy service locks, port collision without killing the unrelated server, missing entry/bad manifest, entry removal during patching and existing watchdog removal without restart.
+- Lifecycle tests copy the component source into their own temporary directory; they do not rename the real repository or installed component entry. They install without --start, prove foreign cold Hooks start no process, then start the real patched CCR through a matching Hook and perform mock inference, idempotence, stop/uninstall/purge.
+- Recipe validation and the local PR branch's 8 supported-base dry resolutions passed. A separate build targets the actual 2026.10.28 base 3768afcf79a7… using the published base lock. No shared bases.json changes were made.
+- The **exact final archive** was unpacked into a fresh work directory: packaged selftest 3/3 and the bundled cold-Hook lifecycle/purge passed. It has **7,343 files, 182 npm packages**, no additional Termux packages; tar **111,968,768 bytes / 106.78 MiB**, gzip **28,266,668 bytes / 26.96 MiB**. Gzip SHA-256: 62a4ac7510b9b6ccbbc8bf7f133651c8c5af3f0f63211bc637681cd96bec01e7. Tar SHA-256: 6652392e6a744273a0c84f34735e0242888f964ab62e90b6e6e38c9b604d3bfc.
+
+All of the above is isolated local verification, not the post-merge official-index/App test or a new hosted market check. No real user configuration, live bridge, paid inference, provider switching or verified.json record is involved.
+
 ## Not completed or claimed
 
 - Official signed-index installation/removal through the App component manager and a current in-App chat have not been completed. A locally extracted package is **not** a signed-index install. No `verified.json` record is added.
 - The market's hosted checks/selftest have passed; the two warning categories were reproduced locally as described above. A downloaded complete hosted Summary is still unavailable; a local reproduction is not presented as that original report.
 - No new in-App graphical OpenAI configuration card or main-App lifecycle integration is implemented; those were explicitly deferred by the maintainer. Configuration remains a user-operated terminal prompt and the existing custom provider form.
-- Existing runtime installs are preserved, not automatically migrated; they do **not** automatically receive these patches. App-only component removal does not stop a private runtime or remove its Hook. Explicit uninstall is documented, with separately authorized purge for complete deletion.
+- Existing runtime installs are preserved, not automatically migrated; they do **not** automatically receive these patches. App-only removal does not delete the private runtime data or Hook; new r4 Hooks/watchdogs stop rearming when the package entry is gone, but an active CCR is not forcibly killed. Explicit uninstall is documented, with separately authorized purge for complete deletion.
 - No current real-provider inference/visual success is claimed from the fake-upstream tests. No private screenshots, conversations or keys were sent, and no paid upstream request was made for this revision.

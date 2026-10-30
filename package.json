@@ -1,6 +1,6 @@
 {
   "name": "cccodroid-openai-bridge",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "description": "Opt-in loopback Chat Completions adapter for cccodroid, with isolated runtime and watchdog",
   "license": "MIT",
@@ -25,6 +25,6 @@
     "tmp": "0.2.7"
   },
   "scripts": {
-    "test": "node tests/test-installer.cjs && node tests/test-install-e2e.cjs && node tests/test-install-e2e.cjs --bundled && node tests/test-response.cjs && node tests/test-security.cjs && python3 tests/test-integration.py && node tests/test-health.cjs && node runtime/selftest.cjs"
+    "test": "node tests/test-installer.cjs && node tests/test-hooks.cjs && node tests/test-install-e2e.cjs && node tests/test-install-e2e.cjs --bundled && node tests/test-response.cjs && node tests/test-security.cjs && python3 tests/test-integration.py && node tests/test-health.cjs && node runtime/selftest.cjs"
   }
 }

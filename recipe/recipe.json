@@ -2,8 +2,8 @@
   "schema": 1,
   "id": "openai-bridge",
   "kind": "termux",
-  "revision": 3,
-  "version": "1.0.3",
+  "revision": 4,
+  "version": "1.0.4",
   "name": { "zh": "OpenAI API 本地协议桥（预览）", "en": "Local OpenAI API bridge (preview)" },
   "desc": {
     "zh": "将用户自有的 OpenAI Chat Completions API 转为本机 Anthropic Messages 接口，请求会转发到用户配置的远端。带 CCR 1.0.73 兼容及依赖安全补丁、受范围限制的 SessionStart 看护；不提供模型或额度。预览组件，包体约 107 MiB，待签名安装及 App 聊通验证。",
@@ -38,5 +38,5 @@
     "usr/lib/openai-bridge/runtime/selftest.cjs": { "src": "runtime/selftest.cjs" },
     "usr/lib/openai-bridge/runtime/health.cjs": { "src": "runtime/health.cjs" }
   },
-  "notes": "源文件在 chenshi723/cccodroid-openai-bridge 修改后由 recipe/sync.sh 同步。运行时只修补专用私有目录中的 CCR 副本，不修改 Claude Code、底座或组件管理的文件；不读 Claude 订阅凭据。移除内嵌旧静态插件及另 249 个受影响内嵌模块，加载锁定修复依赖；@fastify/static 10.1.2、tmp 0.2.7。收录范围已获维护者认可；PR 保持 Draft，待 CI 审计、签名安装和 App 聊通及卸载验证，不能只凭功能测试通过就发布。"
+  "notes": "源文件在 chenshi723/cccodroid-openai-bridge 修改后由 recipe/sync.sh 同步。仅修补专用私有运行副本，不改 Claude Code、底座或组件所有文件、不读订阅凭据。Hook 严格匹配端点后投递看护；包入口删除后不再自启/重启，不强杀现有请求。上游已确认合并后 CI 打包签名，再补 App 实聊、完整卸载及 verified.json；不提供预发布签名索引。安全依赖仍按锁文件和原子指纹补丁验证。"
 }

@@ -11,7 +11,7 @@ const {spawnSync} = require('node:child_process');
 const readline = require('node:readline/promises');
 const {Writable} = require('node:stream');
 
-const VERSION = '1.0.3';
+const VERSION = '1.0.4';
 const CCR_VERSION = '1.0.73';
 const MARKER = '.ccr-bridge-kit.json';
 const SOURCE = __dirname;
@@ -272,7 +272,6 @@ async function install(options) {
   try{
     for(const name of RUNTIME_FILES)fs.copyFileSync(path.join(SOURCE,'runtime',name),path.join(stage,name));
     for(const name of ['package.json','package-lock.json'])fs.copyFileSync(path.join(SOURCE,name),path.join(stage,name));
-    fs.copyFileSync(path.join(SOURCE,'component.cjs'),path.join(stage,'component.cjs'));
     fs.copyFileSync(__filename,path.join(stage,'manage.cjs'));
     for(const [file,cmd] of [['stop.sh','stop'],['uninstall.sh','uninstall'],['status.sh','status']])atomic(path.join(stage,file),wrapper(target,cmd),0o700);
     for(const name of ['LICENSE-CCR.txt','LICENSE','README.md'])if(exists(path.join(SOURCE,name)))fs.copyFileSync(path.join(SOURCE,name),path.join(stage,name));
@@ -292,7 +291,7 @@ async function install(options) {
     atomic(path.join(state,'config.json'),JSON.stringify(routerConfig(config,port,localKey),null,2)+'\n');
     atomic(path.join(stage,'connection.json'),JSON.stringify({baseUrl:'http://127.0.0.1:'+port,apiKey:localKey,model:config.model},null,2)+'\n');
     const files={};
-    for(const name of [...RUNTIME_FILES,'component.cjs','manage.cjs','stop.sh','uninstall.sh','status.sh','package.json','package-lock.json','port']){
+    for(const name of [...RUNTIME_FILES,'manage.cjs','stop.sh','uninstall.sh','status.sh','package.json','package-lock.json','port']){
       const p=path.join(stage,name);fs.chmodSync(p,name.endsWith('.sh')?0o700:0o600);files[name]=sha(fs.readFileSync(p));
     }
     const current=readSettings(settings);

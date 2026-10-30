@@ -1,77 +1,69 @@
 ## 组件 / Component
 
-- id: `openai-bridge`（`1.0.3-r3`，预览）
-- 源仓库 / Source: https://github.com/chenshi723/cccodroid-openai-bridge
-- 协议转换：固定 `@musistudio/claude-code-router` **1.0.73**，MIT；本次另锁定安全修复依赖，并移除私有运行副本中的旧内嵌实现。
-- 配方/文档按市场 Apache-2.0 规范提交；桥接脚本 MIT，保留依赖许可证和原作者信息。
+- id: `openai-bridge`，**1.0.4-r4**（预览）
+- 源仓库：https://github.com/chenshi723/cccodroid-openai-bridge
+- 协议引擎：固定 `@musistudio/claude-code-router` **1.0.73**，MIT；安全依赖版本及内嵌模块替换边界见 `SECURITY.md`。
+- 配方/文档按市场 Apache-2.0 规范贡献；桥本地脚本 MIT，保留原作者与依赖许可证。
 
-## 范围及当前状态
+## 范围与发布顺序
 
-把用户自己有权使用的 **OpenAI Chat Completions API** 适配成本机 Anthropic Messages 接口。消息、工具结果和图片会发给用户自己配置的远端，可能收费；不读取 Claude 订阅凭据、不改 Claude Code、不共享/转售账户、不对外提供服务、不绕过模型安全限制。
+适配用户自己有权使用的 **OpenAI Chat Completions API** 为本机 Anthropic Messages 接口。消息、工具结果和图片会发给用户配置的远端，可能收费；不读取 Claude 订阅凭据、不修改 Claude Code、不共享或转售账户、不暴露公网、不绕过模型安全限制。
 
-**维护者已明确接受收录范围；本 PR 仍保持 Draft，尚未请求合并。** 按维护者回复处理安全及真机验证，主应用配置卡片、生命周期/更新集成留待后续 issue。
+维护者已接受收录范围，认可前版安全整改，并确认第三方 shebang、底座 Node 版本漂移两类提示不算问题。本轮修订已完成，按维护者要求及贡献者确认转为正式审查；不设置自动合并，也不自行合并。
 
-## 2026-10-28 安全整改
+**已按 2026-10-29 的回复确认流程：合并 → 官方 CI 打包并签名发布 → 真机从签名索引安装、App 实聊、完整卸载 → 另提 `verified.json`。不需要预发布签名索引，合并时间由维护者决定。** 尚未做的真机验证保持未勾选，不把本地包或假上游当成正式 App 验证。
 
-- `@fastify/static` 固定/override 为 **10.1.2**，`tmp` override 为 **0.2.7**，锁文件重新生成。`npm audit --omit=dev --audit-level=moderate`：**0 vulnerabilities**。
-- 不只改外部依赖：对 CCR 内嵌静态插件及目录列表代码做 SHA-256 指纹校验后整段移除，改加载修复版插件。
-- 继续检查发现普通 npm audit 看不到的内嵌 Fastify/Undici/ajv/fast-uri/find-my-way/brace-expansion/minimatch/glob/shell-quote 公告；另 **249 个内嵌 CommonJS 模块**同样按指纹移除，加载锁文件固定的修复版本。`SECURITY.md` 列出所有版本和边界。
-- 缺依赖、版本不符、bundle 指纹变化或语法错误时，先失败而不覆盖运行程序。仅修补独立私有运行副本，不改底座/组件管理器所有文件或用户现用手工桥。
-- 原始 npm 程序及 `.orig` 备份仍是上游原文件，**不能直接运行原版 `ccr`**；支持的组件入口、启动脚本和看护会先验证并应用补丁。
-- 源仓库 CI 由非阻断 audit 改成阻断中危及以上；新增有效私有 bundle 审计门禁。84 个剩余内嵌包的公开版本检查：**0 中危/高危/严重匹配**。这里只向 npm 提交公开包名/版本，不上传用户信息。
-- 新增安全负例/正例：旧 bundle 在临时假文件上确实能绕过 `allowedPath`；修复后拒绝非规范路径、编码分隔符、路径及目录列表越界。tmp 拒绝 prefix/postfix/dir 越界。
+## 合并前 Hook 修改
 
-## 功能、卸载与大小
+- Hook 仅匹配 `startup|resume`。`--hook` 在启动 Node、改 HOME、检查依赖、写日志或等锁**之前**校验 `ANTHROPIC_BASE_URL`：只接受本桥的完整 `http://127.0.0.1:<port>` 或其下方路径，不接受相似端口、userinfo 或其他主机。未设/其他接口立即无输出退出。
+- 匹配后仅投递单例 watchdog；不在 Hook 里等服务锁、补丁验证或 HTTP 就绪。watchdog 在启动 CCR 前仍验证安全补丁；手动 `start` 保留就绪检查及明确失败状态。Hook timeout 保持 20 秒作为保险，不拿它当正常等待时间。
+- manifest 指向**组件包入口**，不指向私有复制品。入口删除或元数据无效时，Hook 不启动、手动 start 报失败，私有日志记录清理提示。
+- 已运行 watchdog 每轮及补丁完成后、spawn 前也检查入口；组件删除后退出，不会稍后又重启 CCR。不强杀可能在处理请求的现有 CCR、不自动删用户数据。包已经移除时，仍可在专用私有目录执行 `bash uninstall.sh --yes` 停服务、移除自有 Hook；彻底删除须单独确认 `--purge`。
+- 修正了前版锁文件里误写的 `@protobufjs/float` 版本元数据，使其恢复为 tarball 对应的 **1.0.2**；该依赖的 resolved URL、integrity 及实际代码没有变。
+- 版本与 revision 提升到 **1.0.4-r4**，由源仓库 `recipe/sync.sh` 同步，不直接改市场副本。
 
-- 保留 effort 映射、取消上游、JSON/SSE 嗅探、工具图片转换、本地图片估算和日志级别修复。
-- 配置使用终端私下输入，现有 App「自定义接口」连接本机；不索要、读取或打印用户密钥，不自动切换供应商。
-- SessionStart Hook 仅匹配 `startup|resume`，并以 `--hook` 模式检查 `ANTHROPIC_BASE_URL`；非本桥会话立即跳过，匹配时只异步拉起看护，不占满 65 秒等待。manifest 记录组件入口，App 移除组件后私有副本拒绝自启并提示清理。
-- 默认 `openai-bridge uninstall --yes` 停服务并移除自有 Hook，保留数据；额外显式 `--purge` 才彻底删除专用目录及私有依赖、密钥、日志。真实数据 purge 前单独确认和备份，不能把普通卸载授权当删除授权。
-- 旧运行副本不自动升级；主应用只卸包不会自动清私有副本，后续集成另谈。
-- 本地构建约 **26.96 MiB gzip / 106.78 MiB tar**（28,264,960 / 111,963,648 字节）；**182 个 npm 包**随组件提供，位于私有命名空间，底座之外额外 Termux 包 **0**。首次配置另复制约 98 MiB 私有运行副本。
-- 源仓库 `recipe/sync.sh` 同步，revision 已从 2 增为 3。
+## 功能与依赖安全
 
-## 已完成的本机检查
+- 保留 effort 映射、上游取消、JSON/SSE 嗅探、工具图片转换、本地图片估算和日志级别修复。终端由用户私下配置，App 使用现有自定义接口；不新增图形配置卡、不自动切供应商。
+- `@fastify/static` 10.1.2、tmp 0.2.7；对 CCR 内嵌旧静态插件及另外 249 个受影响 CommonJS 模块按 SHA-256 指纹移除、加载锁定修复依赖。未知指纹、缺依赖或语法错误在写文件/启动前失败。
+- 外部 `npm audit --omit=dev --audit-level=moderate`：**0 vulnerabilities**；有效私有 bundle 剩余 84 个可识别内嵌包，公开公告中危/高危/严重匹配 **0**。这只是检查时点的结果，不是所有代码无漏洞的承诺。
+- 原版 npm bundle 及 `.orig` 备份仍是上游原件，不能绕过受管理入口直接运行 `ccr`。只修补私有运行副本，不改组件管理器、底座或用户现用手工桥的文件。
+- 两层安全门禁均为 CI 阻断检查。安全回归在临时假文件上复现原版路径绕过，验证修复后的实际模块身份、路径/编码分隔符拦截和 tmp 越界拒绝。
 
-设备：Xiaomi M367FC（Xiaomi Pad 9 Pro Max），Android 17 / SDK 37，aarch64，XRing O3 / Mali；普通应用 UID 原生运行，Node 26.4.0、Python 3.14，无 root/Shizuku/chroot/proot。构建基线 `devkit-2026.10.22.3`。
+## 本轮验证
 
-- 17 项安装器单测；独立 npm 安装与组件预装依赖两条完整生命周期（含 scoped Hook、foreign base 跳过、卸载后自启阻断和显式 purge），其他 Hook 与源依赖字节/inode/mtime 保持不变。
-- 76 项请求/响应/原子补丁回归，9 项真实 CCR + 回环假上游 HTTP 测试，健康探测正反例和超时测试。
-- 真 bundle 的安全模块加载身份、静态路径安全及 tmp 越界回归。
-- 外部 audit=0；有效运行 bundle 84 个内嵌包，中危及以上匹配=0。
-- `check-recipes.mjs` 通过，8 个底座 `--dry` 解析通过，本地 devkit 包构建通过。
-- 最终组件归档另解包到隔离目录，自检及完整配置 → 请求 → 重复安装 → 状态 → 保留数据卸载 → 彻底清理通过，不改 live PREFIX。
-- 自检：`CCR=1.0.73 static=10.1.2 JSON/SSE=3/3 effort=OK upstream=loopback-only`。
+环境：Xiaomi M367FC / Xiaomi Pad 9 Pro Max，Android 17 / SDK 37，aarch64，XRing O3 / Mali；普通应用 UID 原生运行。当前 `devkit-2026.10.28`（base `3768afcf79a7…`）、Node 26.12.1、Python 3.14.8；未用 root/Shizuku/chroot/proot。
 
-补充：设备升级到 `devkit-2026.10.28` / Node 26.12.1 / Python 3.14.8 后，已重新通过同一完整测试集、外部和有效 bundle 审计，以及针对当前 base 新构建归档的 selftest、隔离安装/卸载/purge。未修改现用桥或真实配置。
+- 干净 `npm ci --ignore-scripts --omit=dev` 后完整 `npm test` 通过：17 项安装单测、**新增 9 项隔离 Hook 回归**、76 项转换/原子补丁回归、9 项真实 CCR + 回环假上游 HTTP 测试、健康探测和自检。
+- Hook 回归覆盖：无 Node 环境下其他接口/空端点跳过、端口前缀/userinfo/主机误匹配、延迟补丁时冷启动快速返回、`/v1` 路径及并发单例、service.lock 占用、端口冲突不误杀、缺入口/坏 manifest、补丁中删除入口、已运行 watchdog 删除入口后退出且不重启。
+- 独立 npm 与组件预装两种完整生命周期均通过。测试先安装但**不启动**，证明非本桥冷 Hook 不起任何进程，再经匹配 Hook 异步拉起真实修复 CCR、发送假请求；重复安装/状态/卸载/显式 purge 均通过。删除入口只操作临时复制的组件源，不再临时重命名仓库真入口。
+- `check-recipes.mjs` 通过；本地 PR 分支现有 8 个底座 dry 解析通过，另用当前 2026.10.28 官方 base lock 单独构建并校验。没有擅自改公共 `bases.json`；上游 main 已有新底座。
+- 最终归档另解包到新私有工作目录，自检 3/3、真实 CCR 冷 Hook 启动及完整安装/卸载/purge 通过。不是 live PREFIX 安装，不写 `verified.json`。
 
-这些是**隔离本地验证**，不冒充官方签名索引安装或 App 端到端验证。完整记录见源仓库 `TESTING.md`。
+## 包大小和隔离
 
-## 市场 CI 已通过
+当前底座本地构建：**26.96 MiB gzip / 106.78 MiB tar**（28,266,668 / 111,968,768 字节）；7,343 个文件、182 个 npm 包，底座之外额外 Termux 包 **0**。描述中保留约 **107 MiB** 提示。首次配置还复制一份私有运行副本，需要额外空间。npm 依赖全部在组件私有命名空间，不覆盖 Cloudflare 等组件依赖。
 
-- [40617306752 / attempt 2](https://github.com/greyoak111/cccodroid-components/actions/runs/40617306752)：`check`、`audit` success。官方原始日志 **0 错 / 2 警告**；termux-docker selftest `rc=0`、JSON/SSE=3/3、effort=OK。
-- 自动回贴 PR 因 fork token 无 `addComment` 权限失败，不影响最终审计结果。
-- 完整 hosted Summary 未作为 artifact 提供。在同一归档上按原规则本地复现：20 个 foreign shebang（termux-exec 兼容）；旧底座与仓库 Node 版本漂移（26.4.0-2 → 26.12.1，构建仍用固定底座版本）。本地复现不是 hosted Summary 原文，也不替代完整旧底座审计。
-- 官方索引生成于 `2026-10-28T04:44:54.409Z`，按与 App 内置一致的 Ed25519 公钥验签成功，但 **28 个组件里仍无 openai-bridge，官方 Release 也不存在**。
+默认 uninstall 停进程、移除自有 Hook 并保留数据；`--purge` 才永久删整个专用目录及密钥/日志，须单独授权。旧版私有运行副本不自动迁移或悄悄升级，不能把组件包更新说成现有副本已获修复。
 
-## 仍待完成 / Merge blockers
+## CI 状态与后续验证
 
-1. **官方签名索引安装 → 配置 → App 自定义接口聊通 → 卸载干净。** 当前未完成，不写 `verified.json`。需要维护者确认 Draft 未合并时的可信预发布签名索引/安装方式，或先后验证顺序；不自行替换官方信任根，也不把本地包当签名包。
-2. 真实 API 推理需用户自己私下配置并确认内容/费用；本轮没有收费请求，没有上传用户截图、对话、日志或凭据，没有中断现用桥。
+- 旧 1.0.2-r2 的市场 [40617306752 / attempt 2](https://github.com/greyoak111/cccodroid-components/actions/runs/40617306752) check/audit 已通过，selftest rc=0；其结果**不冒充当前修订的新 CI**。新提交由本 PR 再跑；fork 可能需维护者批准。
+- 维护者接受的两个警告已本地复现，完整 hosted Summary 未作为 artifact 提供；报告自动回贴失败原因是 fork token 无 addComment 权限，不是 selftest 失败。
+- **合并签名发布后补**：正式索引安装 → 用户私下配置 → 预先确认内容/费用的 App 实聊 → 完整卸载及无关设置/文件核对 → 单独 `verified.json`。当前没有完成这条链路。
+- 本轮未读真实 API Key、未调用收费模型、未上传私人会话/日志/截图、未切供应商、未中断现用桥。
 
 ## Checklist
 
-- [x] `node tools/check-recipes.mjs`
-- [x] 8 个底座依赖解析及本地构建
-- [x] 外部及有效内嵌依赖安全门禁通过
-- [x] 运行链路、实际转发行为和卸载边界已写进 skill
-- [x] 首次配置不下载运行代码，不改组件管理器所有文件
-- [x] 安全、停止、清数据、花费和公开发布边界明确
-- [x] `needs` 不需要 root/Shizuku/GPU/显示
-- [x] 维护者已确认本地用户自有 API 协议适配属于允许范围
-- [x] 市场 hosted CI 和 termux-docker 自检通过；已读原始日志，两类警告按原规则本地复现（未获取完整 hosted Summary）
-- [ ] 官方签名索引 → App 聊通 → 完整卸载真机验证
+- [x] 按维护者要求收窄 Hook 范围及避免就绪阻塞
+- [x] 入口删除后阻止 Hook 和已有 watchdog 自启/重启
+- [x] matcher 和约 107 MiB 描述已补
+- [x] 新增冷启动、端点边界和删除竞态测试
+- [x] 完整源码测试、双层审计、配方校验及本地归档测试
+- [x] 明确合并后官方签名发布再补真机验证的顺序
+- [ ] 当前修订市场 hosted CI（不拿旧版通过冒充）
+- [ ] 合并后正式签名索引 → App 实聊 → 完整卸载 → verified.json
 
-AI 辅助整理代码、文档和测试；设备验证在贡献者自己的设备上执行。CCR 引擎及 OpenAI API 不属于本贡献原创。
+AI 辅助整理代码、文档及测试；设备测试在贡献者自己的设备执行。CCR 引擎和 OpenAI API 不属于本贡献原创。
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

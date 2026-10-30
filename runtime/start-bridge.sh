@@ -1,7 +1,21 @@
 #!/bin/bash
-# SessionStart：串行打补丁、确保单例看护存在，并等到桥真正就绪。
+# Hook 只投递后台启动；手动 start 保留明确的就绪检查。
 umask 077
 BR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+HOOK_MODE=0
+if [[ "${1:-}" == "--hook" ]]; then
+  HOOK_MODE=1
+  PORT=$(< "$BR/port") || exit 0
+  [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )) || exit 0
+  # 匹配完整 authority 边界，不能把 3459 误认为 34590 或 userinfo。
+  case "${ANTHROPIC_BASE_URL:-}" in
+    "http://127.0.0.1:$PORT"|"http://127.0.0.1:$PORT/"*) ;;
+    *) exit 0 ;;
+  esac
+elif (( $# )); then
+  printf '[start-bridge] 未知启动参数\n' >&2
+  exit 1
+fi
 source "$BR/bridge-common.sh" || exit 1
 unset CCAPP_RUN CLAUDECODE CLAUDE_CODE_ENTRYPOINT
 mkdir -p "$STATE" || exit 1
@@ -15,27 +29,22 @@ fail() {
 for cmd in node flock setsid timeout; do
   command -v "$cmd" >/dev/null 2>&1 || fail "缺少命令：$cmd"
 done
+if ! bridge_component_present; then
+  printf '[start-bridge] 组件已卸载或安装标记无效；请用私有副本 uninstall.sh 清理\n' >> "$LOG"
+  (( HOOK_MODE )) && exit 0
+  fail "组件入口不存在或安装标记无效，未启动服务"
+fi
 [[ -r "$CLI" && -r "$BR/watchdog.sh" ]] || fail "桥文件不完整：$BR"
 
-# App 卸载组件包时会留下这个私有副本和用户级 Hook；入口消失后拒绝启动。
-COMPONENT_ENTRY=$(node -e 'try { const fs = require("node:fs"); const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(typeof m.componentEntry === "string" ? m.componentEntry : ""); } catch {}' "$BR/.ccr-bridge-kit.json" 2>/dev/null || true)
-if [[ -z "$COMPONENT_ENTRY" || ! -f "$COMPONENT_ENTRY" ]]; then
-  printf '[start-bridge] 组件已卸载，入口不存在；请恢复组件后运行 openai-bridge uninstall 清理私有副本\n' | tee -a "$LOG" >&2
+# 看护自己持有单例锁并在启动 CCR 前校验补丁；Hook 不等锁、补丁或 HTTP 就绪。
+if (( HOOK_MODE )); then
+  setsid env -u CCAPP_RUN -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+    bash "$BR/watchdog.sh" >> "$STATE/bridge.out" 2>&1 < /dev/null &
   exit 0
 fi
-# 用户级 Hook 对每个 Claude 会话可见；只有明确指向本桥的会话才启动/等待。
-HOOK_MODE=0
-if [[ "${1:-}" == "--hook" ]]; then
-  HOOK_MODE=1
-  if [[ "${ANTHROPIC_BASE_URL:-}" != "http://127.0.0.1:$PORT"* ]]; then
-    exit 0
-  fi
-fi
 
-# 两把短锁分别保护会话并发，以及与看护之间的补丁/重启竞争。
 exec 9> "$STATE/start.lock" || fail "无法打开启动锁"
 flock -w 10 9 || fail "等待其他启动检查超时"
-# 首次迁移前的旧看护没有锁，不能与新看护并跑；明确报错，不偷偷停止现有工作负载。
 if ! watchdog_running; then
   for PROC in /proc/[0-9]*/cmdline; do
     ARGS=()
@@ -58,21 +67,9 @@ case "$PATCHED" in
 esac
 flock -u 7
 exec 7>&-
-# 就绪等待不占启动锁，多个会话可一起等，避免冷启动时彼此等锁超时。
 flock -u 9
 exec 9>&-
 
-# Hook invocations must not hold Claude startup for the full readiness timeout.
-# The watchdog will finish startup and the client's first request can retry.
-if (( HOOK_MODE )); then
-  if ! watchdog_running && flock -n "$STATE/watchdog.lock" true; then
-    setsid env -u CCAPP_RUN -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
-      bash "$BR/watchdog.sh" >> "$STATE/bridge.out" 2>&1 < /dev/null &
-  fi
-  exit 0
-fi
-
-# 看护自身也持有生命周期锁；旧看护刚退出但子进程尚未释放 FD 时，稍后重试。
 DEADLINE=$((SECONDS + START_TIMEOUT))
 while (( SECONDS < DEADLINE )); do
   if watchdog_running; then

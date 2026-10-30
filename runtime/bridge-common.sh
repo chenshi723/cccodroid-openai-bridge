@@ -19,6 +19,11 @@ bridge_log() {
   printf '[%s] %s %s\n' "$1" "$(date '+%F %T')" "$2" >> "$STATE/bridge.out"
 }
 
+# 只读本安装的元数据，不读取连接文件、上游配置或任何密钥。
+bridge_component_present() {
+  node -e 'try { const fs=require("node:fs"), path=require("node:path"); const root=process.argv[1], m=JSON.parse(fs.readFileSync(path.join(root,".ccr-bridge-kit.json"),"utf8")); if(m.id!=="ccr-bridge-kit"||m.target!==root||typeof m.componentEntry!=="string"||!path.isAbsolute(m.componentEntry)||!fs.statSync(m.componentEntry).isFile()) process.exit(1); } catch { process.exit(1); }' "$BR" 2>/dev/null
+}
+
 # 不凭 PID 文件就杀进程：同时校验 Node、完整脚本路径（或原看护的相对路径 + cwd）。
 bridge_process() {
   local pid=$1

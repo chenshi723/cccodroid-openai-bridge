@@ -9,8 +9,8 @@
 - 基于 MIT 许可的 `@musistudio/claude-code-router` **1.0.73**，固定依赖和完整性锁文件。
 - 含思考强度映射、上游取消、JSON/SSE 嗅探、工具图片处理、用量保留、原子补丁、单例启动及看护。
 - 本仓库是组件源仓库。通过 `recipe/sync.sh` 将配方和可审查源文件同步到 cccodroid 组件市场；不在仓库提交二进制或 node_modules。
-- **尚未被组件市场收录。** 维护者已接受协议适配范围；[PR #53](https://github.com/greyoak111/cccodroid-components/pull/53) 仍保持 Draft，等待 CI 审计及签名安装 → App 聊通 → 干净卸载验证。
-- **1.0.3 修复 Hook 生命周期：** SessionStart 仅匹配 `startup|resume`，并只在 `ANTHROPIC_BASE_URL` 指向本桥时异步拉起看护；App 移除组件后私有副本会拒绝自启并记录清理提示。
+- **尚未被组件市场收录。** 维护者已接受协议适配范围；[PR #53](https://github.com/greyoak111/cccodroid-components/pull/53) 正在完成合并前 Hook 审查。维护者已明确：合并后由官方 CI 打包签名，再补签名索引安装 → App 聊通 → 干净卸载及 `verified.json`；不需要预发布签名索引。
+- **1.0.4 修复 Hook 生命周期：** SessionStart 仅匹配 `startup|resume`；在启动 Node、检查依赖、写日志或等锁前严格匹配本桥地址及端口边界。匹配时只投递后台看护，不等补丁或就绪；入口删除后，已有看护也会退出，不再重启 CCR。
 - **1.0.2 安全整改仍包含：** 静态插件换为 10.1.2、tmp 换为 0.2.7，另移除 249 个受影响内嵌模块并加载锁定修复版；双层审计检查见 [SECURITY.md](SECURITY.md)。这不表示原版 CCR 或所有代码都无漏洞。
 
 ## 运行方式
@@ -33,8 +33,9 @@
 3. 确认新增 SessionStart Hook。运行 `openai-bridge start` 启动，`openai-bridge status` 查看不含密钥的状态。
 4. 在 App 设置的「自定义接口」手动填入配置完成时显示的本机地址、模型以及私有连接文件中的本地密钥。不要把远端 Key 当成本地 Key，不要把连接文件发给 AI 或公开。
 
-组件归档解开约 **107 MiB**；首次配置还会在专用目录复制约 **98 MiB** 私有运行副本。
 5. 组件不会自动改写 App 的供应商列表，也不自动切换正在用的供应商。**此提案没有实现专用图形配置卡片**；若上游希望在 App 内直接填 OpenAI URL/Key/模型，可在确认范围后另开主应用 PR。
+
+组件 tar 约 **107 MiB**；首次配置会在专用目录再复制一份私有运行副本，需额外空间。
 
 运行目录默认是当前 HOME 下 `.local/share/ccr-bridge-kit`，与组件管理器拥有的 `$PREFIX/lib/openai-bridge` 分开。补丁只修改私有运行副本，组件安装目录保持原样。已有手工桥、原 `.claude-code-router`、现有 Hooks 和 Claude 账户凭据不被覆盖。
 
@@ -47,7 +48,7 @@ openai-bridge uninstall --yes
 
 先确认没有需要保留的请求。stop 保留 Hook，新会话会重启；uninstall 停本安装的看护和桥并移除自有 Hook，但保留私有密钥和日志，用户自己决定是否删除。
 
-**在 App 卸载组件前先运行上述 uninstall。** 市场组件卸载只删除包内文件，不会自动结束私有副本或移除 Hook。重复配置保留现有配置，不偷偷迁移、覆盖或自动升级旧运行实例；旧版运行副本不会因组件更新自动获得安全修复。
+**在 App 卸载组件前先运行上述 uninstall。** 市场组件卸载不会自动删私有数据或移除 Hook；残留 Hook 发现包入口消失后只写清理日志，已有看护也会退出、不再重启。正在运行的 CCR 不被强杀，需先显式停止。若已移除组件，可在私有安装目录执行 `bash uninstall.sh --yes` 清理 Hook/进程，不必恢复组件。重复配置保留现有配置，不偷偷迁移、覆盖或自动升级旧运行实例；旧版运行副本不会因组件更新自动获得安全修复。
 
 若是可丢弃的验证安装，或已经另行备份并确认永久删除整个专用目录，可执行 `openai-bridge uninstall --yes --purge`。这会连同私有依赖、密钥、配置、日志一起删除，不是默认行为；操作真实数据前必须单独得到用户同意。其他 Claude 设置及其备份不删除。
 
@@ -64,6 +65,7 @@ openai-bridge uninstall --yes
 ```sh
 npm ci --ignore-scripts --omit=dev --no-audit --no-fund
 node tests/test-installer.cjs
+node tests/test-hooks.cjs
 node tests/test-install-e2e.cjs
 node tests/test-install-e2e.cjs --bundled
 node tests/test-response.cjs
@@ -80,7 +82,7 @@ node tests/audit-bundle.cjs
 
 ## 向组件市场同步
 
-先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（当前 1.0.3-r3）。提案尚未发布。
+先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（当前 1.0.4-r4）。提案尚未发布。
 
 ## 许可与贡献
 

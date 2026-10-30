@@ -1,6 +1,6 @@
 # Security and scope
 
-This is a local, opt-in protocol adapter for an API that the end user is authorized to use. It is not an account-sharing service or a public gateway. It does not read Claude subscription credentials, modify the Claude Code binary, remove model safety controls, or provide any API quota. The component maintainer [accepted this scope](https://github.com/greyoak111/cccodroid-components/pull/53#issuecomment-6419449939); the PR remains Draft pending release-path verification.
+This is a local, opt-in protocol adapter for an API that the end user is authorized to use. It is not an account-sharing service or a public gateway. It does not read Claude subscription credentials, modify the Claude Code binary, remove model safety controls, or provide any API quota. The component maintainer [accepted this scope](https://github.com/greyoak111/cccodroid-components/pull/53#issuecomment-6419449939); the maintainer confirmed that signed-index/App verification follows merge and official CI publication, not a pre-release signed index.
 
 - Listen only on `127.0.0.1`. Never expose the listener through port forwarding or a public reverse proxy.
 - Requests, including tool results and images, are sent to the Chat Completions endpoint configured by the user. Users must review that service's privacy policy, authorization and billing rules.
@@ -37,15 +37,16 @@ Local checks on 2026-10-28: external npm audit **0 vulnerabilities**; the effect
 
 The component manager's immutable CCR source and private `.orig` backup still contain upstream's old bundle. **Do not run the bundled `ccr` CLI directly**: only `openai-bridge` and the managed start scripts apply these remediations. We do not claim that the original npm release or every file in the download is fixed. No debug UI or public server is needed by this component. New upstream versions require re-auditing and new fingerprints; do not force-upgrade CCR underneath these patches.
 
-## Hook and component lifecycle boundaries in 1.0.3
+## Hook and component lifecycle boundaries in 1.0.4
 
-- The user-level `SessionStart` entry is limited to `startup|resume` and invokes `start-bridge.sh --hook` with a 20-second hook timeout. The script exits immediately unless `ANTHROPIC_BASE_URL` starts with this installation's loopback endpoint; matching hook calls only ensure the watchdog is running and do not wait up to the full readiness deadline. Other providers, official accounts, scheduled sessions, `clear` and `compact` are not made to wait for this bridge.
-- The private manifest records the component package's `component.cjs` entry. If the App removes the component package but leaves the private runtime and user Hook, the entry check writes a cleanup hint and exits without starting CCR. It does not delete user data automatically.
-- Existing 1.0.2 private runtimes are not silently migrated or patched by a component update. Reconfigure after uninstalling an old runtime if you need the 1.0.3 Hook boundary; the old runtime's own manager remains available for an explicit stop/uninstall.
+- The user-level `SessionStart` entry is limited to `startup|resume` and invokes `start-bridge.sh --hook` with a 20-second Hook timeout. It matches the full loopback authority before invoking Node, changing HOME, writing logs, checking dependencies or acquiring locks. The exact base URL and paths below it are accepted; another port with the same prefix, userinfo and foreign hosts are rejected.
+- Matching Hook calls only dispatch the single-instance watchdog; they do not wait for patch verification, service locks or HTTP readiness. Manual `start` still checks readiness and reports failure. The watchdog continues to verify the pinned security patch before spawning CCR.
+- The manifest points to the component package entry, never a private copy. Entry absence or invalid metadata blocks Hook, manual and direct-watchdog starts. An already-running watchdog also checks each iteration and after patching, exits on removal and cannot later rearm CCR. It intentionally does not kill an active CCR process or delete user data; explicit private `uninstall.sh --yes` remains available even after the package is gone.
+- Existing private runtimes are not silently migrated by a component update. Their own managers remain available to stop/uninstall them; fresh configuration is required to receive the new lifecycle code.
 
 ## Release and cleanup boundaries
 
-The official signed-index/App install → configuration → in-app chat → complete uninstall and the market's hosted audit review remain separate requirements. Passing isolated tests does not satisfy them. No `verified.json` entry is generated from a local archive.
+The maintainer confirmed on October 29, 2026 that merge is followed by official CI packaging/signing, then signed-index/App install → configuration → in-app chat → complete uninstall and a separate `verified.json` contribution. No pre-release signed index is requested. Isolated tests do not satisfy that post-merge verification; no record is generated from a local archive.
 
 `uninstall --yes` stops this runtime and removes only its own Hook, preserving private data. For a **fully disposable test install**, `uninstall --yes --purge` additionally deletes the entire managed directory, including dependency copies, credentials, logs and local backups. Obtain explicit user approval and any needed backup before purging real data. It rejects symbolic-link/unsafe targets and never deletes the separate Claude settings file or its backup.
 

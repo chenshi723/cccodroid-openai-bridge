@@ -23,6 +23,10 @@ FAILED_SINCE=$SECONDS
 LAST_START=$((-GRACE))
 exec 7> "$STATE/service.lock" || exit 1
 while :; do
+  if ! bridge_component_present; then
+    bridge_log watchdog "组件已卸载或安装标记无效；不再重启，请用私有副本 uninstall.sh 清理"
+    exit 0
+  fi
   if [[ ! -e "$STATE/restart.request" ]] && bridge_healthy; then
     FAILURES=0
     FAILED_SINCE=$SECONDS
@@ -76,6 +80,10 @@ while :; do
     rm -f -- "$PIDFILE"
   fi
 
+  if ! bridge_component_present; then
+    bridge_log watchdog "组件已卸载或安装标记无效；取消本次启动，请用私有副本 uninstall.sh 清理"
+    exit 0
+  fi
   # 两个锁 FD 绝不能传给常驻子进程；否则看护退出后单例锁仍无法释放。
   bridge_log watchdog "starting bridge"
   setsid env -u CCAPP_RUN -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \

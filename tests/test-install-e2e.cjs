@@ -8,7 +8,8 @@ const http=require('node:http');
 const net=require('node:net');
 const {spawn}=require('node:child_process');
 const assert=require('node:assert/strict');
-const kit=process.env.OPENAI_BRIDGE_TEST_SOURCE?path.resolve(process.env.OPENAI_BRIDGE_TEST_SOURCE):path.resolve(__dirname,'..');
+const sourceKit=process.env.OPENAI_BRIDGE_TEST_SOURCE?path.resolve(process.env.OPENAI_BRIDGE_TEST_SOURCE):path.resolve(__dirname,'..');
+let kit=sourceKit;
 const bundled=process.argv.includes('--bundled');
 function exec(args,opts={}){
   if(bundled){
@@ -28,9 +29,15 @@ function command(bin,args,opts={}){
 }
 const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',()=>resolve(server.address().port));});
 (async()=>{
-  const sourceCli=path.join(kit,'node_modules/@musistudio/claude-code-router/dist/cli.js');
+  const sourceCli=path.join(sourceKit,'node_modules/@musistudio/claude-code-router/dist/cli.js');
   const sourceBytes=fs.readFileSync(sourceCli),sourceStat=fs.statSync(sourceCli);
   const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'kit-e2e-'));
+  kit=path.join(tmp,'component-source');fs.mkdirSync(kit);
+  for(const file of ['installer.cjs','component.cjs','package.json','package-lock.json','LICENSE','LICENSE-CCR.txt','README.md']){
+    const from=path.join(sourceKit,file);if(fs.existsSync(from))fs.copyFileSync(from,path.join(kit,file));
+  }
+  fs.cpSync(path.join(sourceKit,'runtime'),path.join(kit,'runtime'),{recursive:true});
+  if(bundled)fs.cpSync(path.join(sourceKit,'node_modules'),path.join(kit,'node_modules'),{recursive:true,verbatimSymlinks:true});
   const target=path.join(tmp,"bridge with quote's");
   const settings=path.join(tmp,'settings.json');
   const cfg=path.join(tmp,'private-config.json');
@@ -50,7 +57,7 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     const upPort=await listen(upstream);
     const probe=net.createServer(),port=await listen(probe);await new Promise(r=>probe.close(r));
     fs.writeFileSync(cfg,JSON.stringify({endpoint:`http://127.0.0.1:${upPort}/v1/chat/completions`,apiKey:'test-upstream-only',model:'test-model',port}),{mode:0o600});
-    let r=await exec(['install','--dir',target,'--settings',settings,'--config',cfg,'--yes','--start']);
+    let r=await exec(['install','--dir',target,'--settings',settings,'--config',cfg,'--yes']);
     assert.equal(r.status,0,r.stdout+'\n'+r.stderr);installed=true;
     assert(!r.stdout.includes('test-upstream-only'));
     console.log('PASS fresh '+(bundled?'bundled offline-copy':'npm-ci')+' install, patch, hook and startup with spaces/apostrophe in path');
@@ -69,12 +76,23 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert.equal(merged.hooks.SessionStart[1].matcher,'startup|resume');
     assert.match(merged.hooks.SessionStart[1].hooks[0].command,/start-bridge\.sh' --hook$/);
     console.log('PASS private generated key/config, unrelated settings preserved');
-    const foreignPid=fs.readFileSync(path.join(state,'.claude-code-router.pid'),'utf8');
-    const foreign=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:'http://127.0.0.1:39999/v1/messages'}});
-    assert.equal(foreign.status,0,foreign.stderr);
-    assert.equal(fs.readFileSync(path.join(state,'.claude-code-router.pid'),'utf8'),foreignPid);
-    assert.equal(await fetch(connection.baseUrl+'/health').then(()=>true,()=>false),true);
-    console.log('PASS foreign Anthropic base URL skips hook without restarting bridge');
+    for(const url of ['', 'https://api.anthropic.com', connection.baseUrl+'@elsewhere.invalid', connection.baseUrl+'.evil.invalid']){
+      const foreign=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:url}});
+      assert.equal(foreign.status,0,foreign.stderr);
+      assert.equal(fs.existsSync(path.join(state,'watchdog.pid')),false);
+      assert.equal(fs.existsSync(path.join(state,'.claude-code-router.pid')),false);
+    }
+    console.log('PASS foreign/empty endpoint cold Hooks do not start any bridge or watchdog');
+    const started=Date.now();
+    r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:connection.baseUrl+'/v1'}});
+    assert.equal(r.status,0,r.stdout+r.stderr);assert.ok(Date.now()-started<3000,'Hook must not wait for readiness');
+    let ready=false;
+    for(let i=0;i<100;i++){
+      ready=await fetch(connection.baseUrl+'/health',{signal:AbortSignal.timeout(300)}).then(r=>r.ok,()=>false);
+      if(ready)break;await new Promise(resolve=>setTimeout(resolve,100));
+    }
+    assert.equal(ready,true,'real CCR did not become ready after cold Hook');
+    console.log('PASS matching cold Hook returns promptly and real patched CCR starts asynchronously');
     const response=await fetch(connection.baseUrl+'/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':connection.apiKey},body:JSON.stringify({model:'test-model',max_tokens:32,stream:true,messages:[{role:'user',content:'local test'}]})});
     const body=await response.text();
     assert.equal(response.status,200,body);assert(body.includes('KIT_LOCAL_TEST_OK'),body);assert(body.includes('message_stop'));
@@ -104,7 +122,7 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     try{
       r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:connection.baseUrl}});
       assert.equal(r.status,0,r.stdout+'\n'+r.stderr);
-      assert.match(r.stderr+r.stdout,/组件已卸载|入口不存在/);
+      assert.match(fs.readFileSync(path.join(state,'start.log'),'utf8'),/组件已卸载|入口不存在/);
       assert.equal(await fetch(connection.baseUrl+'/health').then(()=>true,()=>false),false);
     }finally{fs.renameSync(removedEntry,componentEntry);}
     console.log('PASS removed component entry prevents private runtime auto-start and logs cleanup hint');
