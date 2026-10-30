@@ -9,7 +9,7 @@
 - 基于 MIT 许可的 `@musistudio/claude-code-router` **1.0.73**，固定依赖和完整性锁文件。
 - 含思考强度映射、上游取消、JSON/SSE 嗅探、工具图片处理、用量保留、原子补丁、单例启动及看护。
 - 本仓库是组件源仓库。通过 `recipe/sync.sh` 将配方和可审查源文件同步到 cccodroid 组件市场；不在仓库提交二进制或 node_modules。
-- **尚未被组件市场收录。** 维护者已接受协议适配范围；[PR #53](https://github.com/greyoak111/cccodroid-components/pull/53) 正在完成合并前 Hook 审查。维护者已明确：合并后由官方 CI 打包签名，再补签名索引安装 → App 聊通 → 干净卸载及 `verified.json`；不需要预发布签名索引。
+- **已上架，尚未真机验证。** [PR #53](https://github.com/greyoak111/cccodroid-components/pull/53) 已于 2026-10-30 合并，官方 CI 已打包签名并发布 **1.0.4-r5**（签名索引指向该修订）。签名索引安装 → App 聊通 → 干净卸载及单独的 `verified.json` 仍待补做，App 里暂标「未经真机验证」。
 - **1.0.4 修复 Hook 生命周期：** SessionStart 仅匹配 `startup|resume`；在启动 Node、检查依赖、写日志或等锁前严格匹配本桥地址及端口边界。匹配时只投递后台看护，不等补丁或就绪；入口删除后，已有看护也会退出，不再重启 CCR。
 - **1.0.2 安全整改仍包含：** 静态插件换为 10.1.2、tmp 换为 0.2.7，另移除 249 个受影响内嵌模块并加载锁定修复版；双层审计检查见 [SECURITY.md](SECURITY.md)。这不表示原版 CCR 或所有代码都无漏洞。
 
@@ -24,16 +24,16 @@
 
 远端收到消息、工具结果和图片，按其隐私及收费规则处理。请只配置你有权使用且信任的 API。服务不暴露公网，也不应拿来共享、包装或转售账户。
 
-## 组件使用（仅在维护者收录并发布后）
+## 组件使用
 
 组件管理器会按 npm lockfile 校验并预装 CCR 依赖，不在第一次配置时下载代码。
 
 1. 安装 `openai-bridge` 后运行 `openai-bridge --selftest`，只测试回环假上游，不需要账号、不消耗模型额度。
 2. **用户自己**在终端运行 `openai-bridge configure`，输入完整 Chat Completions URL、自有 API Key 和模型名；密钥不回显。不支持 Responses API。
 3. 确认新增 SessionStart Hook。运行 `openai-bridge start` 启动，`openai-bridge status` 查看不含密钥的状态。
-4. 在 App 设置的「自定义接口」手动填入配置完成时显示的本机地址、模型以及私有连接文件中的本地密钥。不要把远端 Key 当成本地 Key，不要把连接文件发给 AI 或公开。
+4. 在 App 的「设置 → 接口与型号 → 自定义接口」手动填入配置完成时显示的本机地址、模型以及私有连接文件中的本地密钥。不要把远端 Key 当成本地 Key，不要把连接文件发给 AI 或公开。
 
-5. 组件不会自动改写 App 的供应商列表，也不自动切换正在用的供应商。**此提案没有实现专用图形配置卡片**；若上游希望在 App 内直接填 OpenAI URL/Key/模型，可在确认范围后另开主应用 PR。
+5. 组件不会自动改写 App 的供应商列表，也不自动切换正在用的供应商。**本组件没有实现专用图形配置卡片**；若上游希望在 App 内直接填 OpenAI URL/Key/模型，可在确认范围后另开主应用 PR。
 
 组件 tar 约 **107 MiB**；首次配置会在专用目录再复制一份私有运行副本，需额外空间。
 
@@ -82,7 +82,7 @@ node tests/audit-bundle.cjs
 
 ## 向组件市场同步
 
-先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（当前 1.0.4-r4）。提案尚未发布。
+先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（当前 1.0.4-r5）。配方文案的最终版本以市场仓库 `greyoak111/cccodroid-components` 为准，本仓库 `recipe/` 与其保持一致，避免下次同步覆盖。
 
 ## 许可与贡献
 

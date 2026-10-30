@@ -1,6 +1,6 @@
 ---
 name: openai-bridge
-description: 用户要把自己有权使用的 OpenAI Chat Completions API 接入 cccodroid，或检查本机 OpenAI 协议桥的配置、启动和停止时使用；这是待安全评审的预览组件，不提供模型或额度。
+description: 用户要把自己有权使用的 OpenAI Chat Completions API 接入 cccodroid，或检查本机 OpenAI 协议桥的配置、启动和停止时使用；预览组件，不提供模型或额度。
 ---
 
 # OpenAI API 本地协议桥（预览）
@@ -12,7 +12,7 @@ openai-bridge --selftest
 openai-bridge status
 ```
 
-**预览限制：** 维护者已接受本地协议适配范围；签名安装、App 聊通和完整卸载按维护者流程在合并签名发布后验证，未完成前不写 verified.json。1.0.4 在任何 Node/日志/锁操作前严格匹配 Hook 端点，且已有看护在组件删除后也不再重启；1.0.2 的外部及受影响内嵌依赖修复范围见源仓库 `SECURITY.md`。不代表原版 CCR 或所有代码无漏洞。只用受管理入口，不直接运行原版 `ccr`，不暴露公网，不直接升级 CCR 后沿用旧补丁。
+**预览组件：** 还没在真机上走完签名安装、App 聊通和完整卸载，App 里标「未经真机验证」。只用受管理入口 `openai-bridge`，不要直接运行原版 `ccr`、不要暴露到公网、不要单独升级 CCR（安全补丁按指纹对 1.0.73 打，换版本会拒绝启动）。依赖修复范围见源仓库 `SECURITY.md`。
 
 ## 运行链路
 
@@ -49,7 +49,7 @@ openai-bridge start
 openai-bridge status
 ```
 
-配置完成时会打印本机端点、模型名和本地连接信息的私有文件位置。用户自己到 cccodroid「设置 → 模型服务 → 自定义接口」填写本机端点及本地桥密钥；不要把远端 API Key 当成本地密钥。该组件没有新增图形配置表单，也不会偷偷改动或切换 App 的供应商配置。
+配置完成时会打印本机端点、模型名和本地连接信息的私有文件位置。用户自己到 cccodroid「设置 → 接口与型号 → 自定义接口」填写本机端点及本地桥密钥；不要把远端 API Key 当成本地密钥。该组件没有新增图形配置表单，也不会偷偷改动或切换 App 的供应商配置。
 
 ## 停止与卸载
 

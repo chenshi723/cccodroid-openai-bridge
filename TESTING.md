@@ -67,6 +67,15 @@ The maintainer confirmed on October 29 that the official order is **merge → CI
 
 All of the above is isolated local verification, not the post-merge official-index/App test or a new hosted market check. No real user configuration, live bridge, paid inference, provider switching or verified.json record is involved.
 
+## Post-merge publication — 2026-10-30, 1.0.4-r5
+
+PR #53 was **merged** at `2026-10-30T18:47:06Z` by the maintainer (merge commit `0cdcc9d8ae267bc26fcac9c77d837118b6347e31`, reviewed head `6dd842d`). After the merge the maintainer added two text-only commits on `main`: `1ee9b00` (README "published, not yet verified", corrected settings path, skill wording) and `be39ce5` (revision 4 → 5, because r4 had already been packaged before the text cleanup). No bridge code, patch or test changed in either commit.
+
+- The signed market index now points to **`openai-bridge` 1.0.4-r5** (index updated `2026-10-30T19:12:58Z`); both r4 and r5 assets exist on the Release.
+- This source repository was synced back from `origin/main` for `recipe/recipe.json` and `recipe/skill/SKILL.md`, so the next `recipe/sync.sh` is a no-op instead of reverting the maintainer's wording. Source README status was updated to "published, not yet device-verified".
+- Local code and tests are unchanged from the r4 verification above; the source tree still passes the same suites.
+- The remaining release-path steps — signed-index install through the App, configuration, in-App chat, complete uninstall and a separate `verified.json` contribution — are **not done yet** and are not claimed here.
+
 ## Not completed or claimed
 
 - Official signed-index installation/removal through the App component manager and a current in-App chat have not been completed. A locally extracted package is **not** a signed-index install. No `verified.json` record is added.
