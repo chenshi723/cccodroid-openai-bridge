@@ -1,32 +1,16 @@
-市场机审已确认通过，补一下当前状态，避免上条“等待批准”造成误解。
+谢谢明确流程。上条回复还在重复询问预发布签名索引，是我没有同步好你的说明，现已纠正：**合并后由官方 CI 打包签名，再做签名索引安装 → App 实聊 → 完整卸载，另提 verified.json**。不再请求预发布索引，也不把未做项目写成完成。
 
-### 已核实的官方 CI
+合并前的修改已推送为 **1.0.4-r4**：源码 `e4b40e4`，本 PR 配方 `6dd842d`。
 
-[40617306752 / attempt 2](https://github.com/greyoak111/cccodroid-components/actions/runs/40617306752) 的 **check、audit 都是 success**。原始日志为 `openai-bridge：0 错 2 警告`；termux-docker 自检 `rc=0`，JSON/SSE=3/3、effort=OK。
+- Hook 仍仅匹配 `startup|resume`；端点校验移到 Node、依赖检查、HOME/日志/锁操作之前。匹配完整本桥 authority 或其下方路径，不会把同前缀端口、userinfo 或其他主机当成本桥。空端点/其他接口无输出立即退出。
+- 匹配 Hook 只投递后台单例 watchdog，不等补丁、service.lock 或 HTTP 就绪；手动 start 仍会检查并报告就绪失败。安全补丁始终在 watchdog 启动 CCR 前验证。
+- manifest 指向组件包入口，不指向私有拷贝。入口不存在/标记无效时，残留 Hook 只记清理日志，手动启动明确失败。已运行 watchdog 每轮及补丁后、spawn 前也复核，组件删除后退出、不再重启；不擅自强杀现有请求。包已移除时私有 `uninstall.sh --yes` 仍可清理，不要求重装。
+- 描述已注明约 107 MiB tar 包体。修正上一修订中误写的 @protobufjs/float 锁文件版本元数据，恢复为其未变 tarball 对应的 1.0.2，resolved/integrity 和实际依赖代码不变。
 
-报告自动回贴失败是 fork workflow 的 `addComment` 权限不足，不是审计或 selftest 失败。
+本轮干净 npm ci 后完整测试通过：17 安装单测、**新增 9 项 Hook 生命周期回归**、76 转换/原子补丁回归、9 真实 CCR + 回环假上游 HTTP、自检 3/3；两条安装生命周期都从冷 Hook 启动真实 CCR，覆盖删除临时组件入口、卸载/purge、无关 Hook 及源依赖不变。新增测试还覆盖忙锁、端口冲突、延迟补丁、并发单例、入口在补丁中删除、已有看护删除入口后退出且不重启。
 
-完整 hosted Summary 没有作为 artifact 提供，未把本地报告冒充原报告。我在同一归档上按相同规则复现了两类警告：
+外部 audit **0 vulnerabilities**；有效 bundle 84 个剩余内嵌包中危及以上匹配 **0**。配方检查和本地 8 个底座 dry 解析通过；当前 2026.10.28 base 另行构建的最终归档已解包，自检及真实 CCR 冷 Hook 全生命周期通过。以上都是隔离本地结果，不代替本修订的新市场 CI，也不是正式 App 实聊。
 
-1. **20 个脚本 shebang 不在应用前缀下**，例如 npm 自带的 `/usr/bin/env node` 和 Bash 脚本；由 termux-exec 兼容，受管理入口实际通过 Node/Bash 启动。官方及本机 selftest、生命周期均通过。
-2. **旧底座 Node 26.4.0-2 与仓库 Node 26.12.1 版本漂移**；构建仍按底座固定版本，不会覆盖或升级用户的 Node。
-
-没有为消除提示修改第三方 shebang、降级安全检查或扩大运行入口。临时本地复现只补齐了安装清单未列出的实际符号链接，并跳过 Release 大小对比；生产审计器没有修改。
-
-### 当前工具包已补测
-
-设备已升级 `devkit-2026.10.28`（base `3768afcf79a7…`）、Node 26.12.1 / Python 3.14.8。重新跑完整测试和双层依赖审计，全部通过；也针对当前 base 重新打包并在隔离目录完成 selftest、配置、假上游请求、重复安装、状态、卸载及显式 purge。未操作现用桥、真实密钥或收费 API，没有生成 `verified.json`。
-
-### 签名安装仍需要一个可信构件
-
-我下载了官方 `components.json` 和 `.sig`，用与 App 内置一致的 Ed25519 公钥验签成功。索引生成时间 `2026-10-28T04:44:54.409Z`，28 个组件里**没有 openai-bridge**，对应官方 Release 也不存在。因此当前不能从官方签名索引安装，不是 App 里填一下配置就能继续。
-
-可以请你提供一个**用 App 已信任公钥可验证的预发布签名索引/包**，或明确允许先后调整为“合并并出签名包后立即补真机记录”吗？如果走后者，请维护者明确确认例外及顺序，我不会自行把未完成项勾成已完成，也不会擅自转 Ready/请求合并。目前仍保持 Draft。
-
-你提出的两处 Hook 生命周期修改已实现并推送为 **1.0.3-r3**（源码提交 `ed0e633`，组件配方提交 `cd7d67d`），并补了隔离回归：SessionStart 只匹配 `startup|resume`，`--hook` 仅在 `ANTHROPIC_BASE_URL` 指向本桥时异步拉起看护；manifest 记录组件入口，入口消失时不自启并记录清理提示；包体约 107 MiB 已写进描述。
-
-源码完整测试、外部 audit 和有效 bundle audit 均通过；市场配方格式检查和 8 个底座依赖 dry 解析也通过。PR 仍保持 Draft，尚未请求合并。
-
-拿到构件后，按官方签名安装 → 用户自己私下配置 → App 仅发预先确认的测试消息 → 彻底卸载及核对 Hook/文件的流程补证据。
+按你的要求及贡献者确认，原 PR 现在转为 **Ready for review**，请按方便的时间审查；**不设置自动合并，不自行合并/发布**。新市场 CI 如仍需批准，请协助批准。本轮未触碰现用桥、真实密钥、模型配置或收费请求。
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
