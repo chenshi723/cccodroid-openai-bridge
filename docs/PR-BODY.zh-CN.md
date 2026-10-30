@@ -48,8 +48,8 @@
 
 ## CI 状态与后续验证
 
-- 旧 1.0.2-r2 的市场 [40617306752 / attempt 2](https://github.com/greyoak111/cccodroid-components/actions/runs/40617306752) check/audit 已通过，selftest rc=0；其结果**不冒充当前修订的新 CI**。新提交由本 PR 再跑；fork 可能需维护者批准。
-- 维护者接受的两个警告已本地复现，完整 hosted Summary 未作为 artifact 提供；报告自动回贴失败原因是 fork token 无 addComment 权限，不是 selftest 失败。
+- 当前 1.0.4-r4 配方 `6dd842d` 的市场 [41013128067 / attempt 2](https://github.com/greyoak111/cccodroid-components/actions/runs/41013128067)：`check`、`audit` 均 **success**。审计为 **0 错 / 1 警告**（第三方 shebang；当前底座已无 Node 版本漂移告警），termux-docker selftest `rc=0`、JSON/SSE=3/3、effort=OK。
+- 完整 hosted Summary 未作为 artifact 提供；本次报告自动回贴仍因 fork token 无 addComment 权限失败（该步骤 continue-on-error），不是审计或 selftest 失败。旧 1.0.2-r2 的通过记录不作为当前修订结果。
 - **合并签名发布后补**：正式索引安装 → 用户私下配置 → 预先确认内容/费用的 App 实聊 → 完整卸载及无关设置/文件核对 → 单独 `verified.json`。当前没有完成这条链路。
 - 本轮未读真实 API Key、未调用收费模型、未上传私人会话/日志/截图、未切供应商、未中断现用桥。
 
@@ -61,7 +61,7 @@
 - [x] 新增冷启动、端点边界和删除竞态测试
 - [x] 完整源码测试、双层审计、配方校验及本地归档测试
 - [x] 明确合并后官方签名发布再补真机验证的顺序
-- [ ] 当前修订市场 hosted CI（不拿旧版通过冒充）
+- [x] 当前修订市场 hosted CI（0 错 1 警告，selftest 3/3；回贴失败仅为 fork 评论权限）
 - [ ] 合并后正式签名索引 → App 实聊 → 完整卸载 → verified.json
 
 AI 辅助整理代码、文档及测试；设备测试在贡献者自己的设备执行。CCR 引擎和 OpenAI API 不属于本贡献原创。
