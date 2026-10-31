@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "openai-bridge",
   "kind": "termux",
-  "revision": 7,
+  "revision": 8,
   "version": "1.0.5",
   "name": { "zh": "OpenAI API 本地协议桥（预览）", "en": "Local OpenAI API bridge (preview)" },
   "desc": {
@@ -39,5 +39,5 @@
     "usr/lib/openai-bridge/runtime/health.cjs": { "src": "runtime/health.cjs" },
     "usr/lib/openai-bridge/runtime/service-registration.cjs": { "src": "runtime/service-registration.cjs" }
   },
-  "notes": "未发布的配套候选，需要支持v1本地服务注册/ensure契约的App：配置只注册非密钥端点/实例，App包装URL前等待桥就绪；旧App不透明通道不能靠Hook恢复。看护有持久三次恢复预算，故障后须用户显式重置；卸载写停用标记并只移除自身注册/Hook，默认保留数据。仅改专用私有副本，不改Claude Code或签名根。八项交付验收、正式签名配套包及原生App验证未全部完成，不伪造verified.json。源修改后由recipe/sync.sh同步，依赖安全仍按锁文件和指纹补丁验证。"
+  "notes": "配套App支持桥卡片内三字段图形配置，固定组件以stdin收配置，不远端测试/不切当前会话；用户主动新建才用，旧Key不回显。需要支持v1本地服务注册/ensure契约的配套App：先发布兼容App，再发布组件并经用户确认配置或迁移；配置只注册非密钥端点/实例，App包装URL前等待桥就绪，旧App不透明通道不能靠Hook恢复。看护有持久三次恢复预算；固定卸载入口核对端点/实例后写停用标记并移除自身注册/Hook，默认保留数据。配套App对坏注册或未知schema不执行脚本，卸载清固定残留注册而不被其卡住。仅改专用私有副本，不改Claude Code或签名根。最终签名配套包的原生八项验收未全部完成，不伪造verified.json。源修改后由recipe/sync.sh同步，依赖安全仍按锁文件和指纹补丁验证。"
 }

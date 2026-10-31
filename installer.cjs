@@ -208,6 +208,65 @@ function managedIntact(target,m) {
     if(!exists(p)||fs.lstatSync(p).isSymbolicLink()||sha(fs.readFileSync(p))!==hash)throw new Error('安装文件被修改，拒绝静默覆盖：'+p);
   }
 }
+function instanceOptions(command,options) {
+  const endpoint=options.endpoint!==undefined, instance=options.instance!==undefined;
+  if(endpoint!==instance)throw new Error('--endpoint 和 --instance 必须同时提供。');
+  if(endpoint&&!['ensure','uninstall'].includes(command))throw new Error('--endpoint/--instance 只适用于 ensure 或 uninstall。');
+  if(command==='ensure'&&!endpoint)throw new Error('ensure 必须提供 --endpoint 和 --instance。');
+  if(endpoint&&(typeof options.endpoint!=='string'||typeof options.instance!=='string'||!/^[0-9a-f]{32}$/.test(options.instance)))throw new Error('本地桥实例参数不合法。');
+  return endpoint;
+}
+function regularFile(file) {
+  const st=fs.lstatSync(file);
+  if(!st.isFile()||st.isSymbolicLink())throw new Error('实例元数据必须是普通文件：'+file);
+  return st;
+}
+function sameFile(a,b) { return a.dev===b.dev&&a.ino===b.ino; }
+function checkInstance(target,options,previous=null,registered=true) {
+  // App 的卸载授权仅属于完整匹配的注册实例；不读 connection/config 或任何密钥。
+  const targetStat=fs.lstatSync(target);
+  if(!targetStat.isDirectory()||fs.realpathSync(target)!==target)throw new Error('实例目录或父路径不规范，拒绝操作。');
+  regularFile(path.join(target,MARKER));
+  const m=loadManifest(target),service=m.service,home=path.resolve(os.homedir());
+  if(m.target!==target||!object(service)||service.schema!==1||service.home!==home||fs.realpathSync(home)!==home||service.instanceId!==options.instance)throw new Error('本地桥实例注册不匹配。');
+  regularFile(path.join(target,'port'));
+  const portText=fs.readFileSync(path.join(target,'port'),'utf8'),port=Number(portText);
+  if(!Number.isInteger(port)||(portText!==String(port)&&portText!==String(port)+'\n'))throw new Error('实例端口不是规范整数。');
+  if(port<1024||port>65535||options.endpoint!=='http://127.0.0.1:'+port)throw new Error('本地桥 endpoint 与实例端口不匹配。');
+  if(typeof m.settings!=='string'||!path.isAbsolute(m.settings)||path.resolve(m.settings)!==m.settings)throw new Error('实例设置路径不规范。');
+  safeTarget(target,m.settings);
+  const registryDir=path.dirname(registration.fileOf(home));
+  if(fs.realpathSync(registryDir)!==registryDir)throw new Error('服务注册目录或父路径不规范。');
+  const matches=registered?registration.check(home,target,port,service.instanceId):registration.read(home)===null;
+  if(!matches)throw new Error('本地桥服务注册已变更，拒绝操作。');
+  if(!object(m.files)||!Object.hasOwn(m.files,'bridge-common.sh')||!Object.hasOwn(m.files,'port'))throw new Error('实例缺少受管理的运行文件。');
+  for(const [name,hash] of Object.entries(m.files)){
+    if(path.basename(name)!==name||name==='.'||name==='..'||typeof hash!=='string'||!/^[0-9a-f]{64}$/.test(hash))throw new Error('实例运行文件清单不合法。');
+    regularFile(path.join(target,name));
+  }
+  managedIntact(target,m);
+  if(previous&&(!sameFile(previous.targetStat,targetStat)||!same(previous.manifest,m)||previous.port!==port))throw new Error('操作期间实例元数据已变更。');
+  return {target,home,port,manifest:m,targetStat};
+}
+function withInstanceLock(instance,fn) {
+  // 使用 registration.register/unregister 的同一把锁，但绝不为无效实例创建锁或目录。
+  const file=path.join(path.dirname(registration.fileOf(instance.home)),'openai-bridge.lock');
+  const original=regularFile(file);
+  const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+  const check=()=>{
+    if(!sameFile(original,fs.fstatSync(fd))||!sameFile(original,regularFile(file)))throw new Error('操作期间服务注册锁已变更。');
+  };
+  try{
+    check();
+    const r=run('flock',['-w','5','3'],{stdio:['ignore','ignore','pipe',fd],timeout:6000});
+    if(r.status!==0)throw new Error('服务注册正在使用，未修改。');
+    check();
+    const result=fn(check);
+    if(result&&typeof result.then==='function')return result.finally(()=>fs.closeSync(fd));
+    fs.closeSync(fd);
+    return result;
+  }catch(error){fs.closeSync(fd);throw error;}
+}
 function showConnection(target,showKey=false) {
   const m=loadManifest(target);
   const keyfile=path.join(target,'connection.json');
@@ -235,6 +294,7 @@ async function install(options) {
   const settings=path.resolve(options.settings||path.join(os.homedir(),'.claude','settings.json'));
   const target=safeTarget(options.dir||path.join(os.homedir(),'.local','share','ccr-bridge-kit'),settings);
   if(exists(target)){
+    if(options.guiConfig)throw guiError('RUNTIME_CONFLICT');
     const m=loadManifest(target);
     managedIntact(target,m);
     if(m.settings!==settings)throw new Error('重复安装不能更换 settings 路径。');
@@ -254,7 +314,9 @@ async function install(options) {
   if(service&&registration.read(service.home))throw new Error('已有本地桥服务注册，未覆盖；请先处理原安装。');
   let port=options.port===undefined?undefined:Number(options.port);
   let config;
-  if(options.config){
+  if(options.guiConfig){
+    config=options.guiConfig;
+  }else if(options.config){
     const p=path.resolve(options.config);
     config=json(p);
     if(port===undefined&&config.port!==undefined)port=Number(config.port);
@@ -265,8 +327,10 @@ async function install(options) {
   port??=await choosePort();
   config=validateConfig(config,port);
   if(!await portFree(port))throw new Error('端口已占用：'+port+'；请改用 --port。');
-  console.log('安装目录：'+target);
-  console.log(bundled?'将复制组件内固定版本 CCR 1.0.73 到专用运行目录；不联网安装、不测试远端模型。':'将联网从 npm 下载固定版本 CCR 1.0.73；不向模型服务发送测试请求。');
+  if(!options.quiet){
+    console.log('安装目录：'+target);
+    console.log(bundled?'将复制组件内固定版本 CCR 1.0.73 到专用运行目录；不联网安装、不测试远端模型。':'将联网从 npm 下载固定版本 CCR 1.0.73；不向模型服务发送测试请求。');
+  }
   if(!options.yes){
     if(!process.stdin.isTTY)throw new Error('非交互安装还需要 --yes。');
     if((await ask('继续安装？输入 yes'))!=='yes')throw new Error('已取消，未修改设置。');
@@ -302,22 +366,206 @@ async function install(options) {
     const current=readSettings(settings);
     if(!same(current,original))throw new Error('安装期间 Claude 设置被其他程序修改，已停止，未覆盖。');
     const merged=mergeHook(current,target);
+    if(options.guiBeforeDeploy)options.guiBeforeDeploy();
     const saved=exists(settings)?backup(settings):null;
-    atomic(path.join(stage,MARKER),JSON.stringify({id:'ccr-bridge-kit',version:VERSION,target,settings,settingsBackup:saved,componentEntry:path.join(SOURCE,'component.cjs'),hook:hookEntry(target),service,files},null,2)+'\n');
+    atomic(path.join(stage,MARKER),JSON.stringify({id:'ccr-bridge-kit',version:VERSION,target,settings,settingsBackup:saved,componentEntry:path.join(SOURCE,'component.cjs'),hook:hookEntry(target),service,files,...(options.guiConfig?{guiManaged:true}:{})},null,2)+'\n');
+    if(options.guiBeforeDeploy)options.guiBeforeDeploy();
     fs.renameSync(stage,target);deployed=true;
-    if(service)registration.register(service.home,target,port,service.instanceId);
+    if(service){
+      if(options.guiRegister)options.guiRegister(service,target,port);
+      else registration.register(service.home,target,port,service.instanceId);
+    }
     try{atomic(settings,JSON.stringify(merged,null,2)+'\n');}
     catch(e){throw new Error('安装文件已保留，但钩子写入失败；修正权限后重新执行安装器即可。'+e.message);}
-    console.log('安装完成；已合并 SessionStart 钩子，未修改客户端全局认证。');
-    showConnection(target);
-    console.log('先在 App/客户端中填写上述本机服务地址、自己的模型和本地桥密钥，再开始新会话。');
+    if(!options.quiet){
+      console.log('安装完成；已合并 SessionStart 钩子，未修改客户端全局认证。');
+      showConnection(target);
+      console.log('先在 App/客户端中填写上述本机服务地址、自己的模型和本地桥密钥，再开始新会话。');
+    }
     if(options.start){
       const r=run('bash',[path.join(target,'start-bridge.sh')],{env:cleanEnv(),timeout:110000,stdio:'inherit'});
       if(r.status!==0)throw new Error('文件已安装，但启动失败；请查看 '+path.join(target,'runtime-home','.claude-code-router','bridge.out'));
       console.log('本地桥健康检查通过。');
-    }else console.log('下次会话自动启动；也可运行 bash '+quote(path.join(target,'start-bridge.sh')));
+    }else if(!options.quiet)console.log('下次会话自动启动；也可运行 bash '+quote(path.join(target,'start-bridge.sh')));
   }finally{
     if(!deployed&&exists(stage))fs.rmSync(stage,{recursive:true,force:true});
+  }
+}
+const GUI_MESSAGES={INVALID_INPUT:'请检查 API 地址、API Key 和模型名称。',KEY_REQUIRED:'首次配置需要 API Key。',KEY_HOST_CHANGED:'更换服务地址来源后必须重新输入 API Key。',RUNTIME_CONFLICT:'已有安装不符合图形配置安全约定；未覆盖，请先处理原安装。',BUSY:'桥配置正在使用，请稍后重试。'};
+function guiError(code){const error=new Error(GUI_MESSAGES[code]||GUI_MESSAGES.RUNTIME_CONFLICT);error.guiCode=code;return error;}
+function guiPaths(){
+  const home=path.resolve(os.homedir()),target=path.join(home,'.local/share/ccr-bridge-kit'),settings=path.join(home,'.claude/settings.json');
+  if(fs.realpathSync(home)!==home)throw guiError('RUNTIME_CONFLICT');
+  const canonical=file=>{let parent=file;while(!exists(parent))parent=path.dirname(parent);if(fs.realpathSync(parent)!==parent)throw guiError('RUNTIME_CONFLICT');};
+  canonical(target);canonical(settings);canonical(path.dirname(registration.fileOf(home)));
+  safeTarget(target,settings);
+  return {home,target,settings};
+}
+function scrubGuiEnv(){
+  // 配置/启动不继承会话代理和外部桥调参，防止状态探测或子进程走到非本机目标。
+  for(const name of Object.keys(process.env))if(/^(ANTHROPIC_|CLAUDE_|CCAPP_|CCR_BRIDGE_)/.test(name)||/^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SERVICE_PORT)$/.test(name))delete process.env[name];
+}
+function normalizeGuiEndpoint(input){
+  if(typeof input!=='string'||input.length>2048||/[\u0000- \u007f\\]/.test(input))throw guiError('INVALID_INPUT');
+  let url;try{url=new URL(input);}catch{throw guiError('INVALID_INPUT');}
+  if(url.username||url.password||url.search||url.hash||url.protocol!=='https:')throw guiError('INVALID_INPUT');
+  const pathname=url.pathname.replace(/\/+$/,'');
+  if(!pathname||pathname==='/v1')url.pathname='/v1/chat/completions';
+  else if(pathname.endsWith('/chat/completions'))url.pathname=pathname;
+  else throw guiError('INVALID_INPUT');
+  return url.href;
+}
+async function guiInput(){
+  let size=0;const chunks=[];
+  try{
+    for await(const chunk of process.stdin){size+=chunk.length;if(size>16384)throw guiError('INVALID_INPUT');chunks.push(chunk);}
+    const input=JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if(!object(input)||Object.keys(input).some(k=>!['endpoint','apiKey','model'].includes(k))||typeof input.endpoint!=='string'||typeof input.model!=='string'||input.apiKey!==undefined&&typeof input.apiKey!=='string')throw guiError('INVALID_INPUT');
+    const apiKey=(input.apiKey||'').trim(),model=input.model.trim();
+    if(apiKey.length>1024||/[\u0000- \u007f]/.test(apiKey)||!model||input.model.length>200||/[,\u0000-\u001f\u007f]/.test(input.model))throw guiError('INVALID_INPUT');
+    return {endpoint:normalizeGuiEndpoint(input.endpoint),apiKey,model};
+  }catch(error){if(error.guiCode)throw error;throw guiError('INVALID_INPUT');}
+}
+function checkGuiRuntime(paths,previous=null,allowConfiguring=false){
+  const {home,target,settings}=paths;
+  if(!exists(target)){
+    if(registration.read(home))throw guiError('RUNTIME_CONFLICT');
+    return null;
+  }
+  if(regularFile(path.join(target,MARKER)).size>65536)throw guiError('RUNTIME_CONFLICT');
+  const portStat=regularFile(path.join(target,'port'));
+  if(portStat.size>6)throw guiError('RUNTIME_CONFLICT');
+  const m=loadManifest(target),portText=fs.readFileSync(path.join(target,'port'),'utf8');
+  const options={endpoint:'http://127.0.0.1:'+Number(portText),instance:m.service?.instanceId};
+  instanceOptions('ensure',options);
+  const instance=checkInstance(target,options,previous?.instance);
+  const disabled=path.join(target,'disabled');
+  if(m.guiManaged!==true||m.settings!==settings||m.componentEntry!==path.join(SOURCE,'component.cjs'))throw guiError('RUNTIME_CONFLICT');
+  if(exists(disabled)){
+    regularFile(disabled);
+    if(!allowConfiguring||fs.readFileSync(disabled,'utf8')!=='configuring\n')throw guiError('RUNTIME_CONFLICT');
+  }
+  for(const name of RUNTIME_FILES){
+    regularFile(path.join(SOURCE,'runtime',name));
+    if(m.files[name]!==sha(fs.readFileSync(path.join(SOURCE,'runtime',name))))throw guiError('RUNTIME_CONFLICT');
+  }
+  // GUI 仅接管本组件完整且当前兼容的 bundled 运行副本，绝不覆盖手工/旧版本脚本。
+  const configPath=path.join(target,'runtime-home/.claude-code-router/config.json'),connectionPath=path.join(target,'connection.json');
+  for(const dir of [path.dirname(configPath),path.join(target,'runtime-home')])if(fs.realpathSync(dir)!==dir)throw guiError('RUNTIME_CONFLICT');
+  for(const file of [configPath,connectionPath]){
+    const stat=regularFile(file);
+    if((stat.mode&0o077)!==0||stat.size>16384)throw guiError('RUNTIME_CONFLICT');
+  }
+  const configText=fs.readFileSync(configPath,'utf8'),connectionText=fs.readFileSync(connectionPath,'utf8');
+  const config=JSON.parse(configText),connection=JSON.parse(connectionText);
+  if(!object(config)||!object(connection)||!Array.isArray(config.Providers)||config.Providers.length!==1)throw guiError('RUNTIME_CONFLICT');
+  const provider=config.Providers[0],model=connection.model;
+  if(typeof model!=='string'||!model||model.length>200||/[,\u0000-\u001f\u007f]/.test(model)||typeof provider?.api_key!=='string'||provider.api_key.length>1024||/[\u0000- \u007f]/.test(provider.api_key))throw guiError('RUNTIME_CONFLICT');
+  let endpoint;try{endpoint=normalizeGuiEndpoint(provider?.api_base_url);}catch{throw guiError('RUNTIME_CONFLICT');}
+  const validated=validateConfig({endpoint,apiKey:provider.api_key,model},instance.port);
+  if(endpoint!==provider.api_base_url||connection.baseUrl!==options.endpoint||typeof connection.apiKey!=='string'||!/^[0-9a-f]{48}$/.test(connection.apiKey)||!same(config,routerConfig(validated,instance.port,connection.apiKey)))throw guiError('RUNTIME_CONFLICT');
+  if(previous&&(previous.configText!==configText||previous.connectionText!==connectionText))throw guiError('RUNTIME_CONFLICT');
+  return {instance,options,configPath,connectionPath,configText,connectionText,endpoint,model,apiKey:validated.apiKey,localKey:connection.apiKey};
+}
+async function guiLocalReady(target,port){
+  // 不再读取可变 connection.baseUrl；只探测已验证端口的字面量回环 /health。
+  const r=run('bash',['-c','source "$1/bridge-common.sh" || exit 1; bridge_pid >/dev/null','bridge-gui-health',target],{env:cleanEnv(),timeout:3000});
+  if(r.status!==0)return false;
+  return await new Promise(resolve=>{
+    const req=http.get({hostname:'127.0.0.1',port,path:'/health',timeout:1500,agent:false},res=>{
+      let body='';res.on('data',chunk=>{body+=chunk;if(body.length>4096){req.destroy();resolve(false);}});
+      res.on('error',()=>resolve(false));res.on('end',()=>{try{resolve(res.statusCode===200&&JSON.parse(body).status==='ok');}catch{resolve(false);}});
+    });
+    req.on('timeout',()=>{req.destroy();resolve(false);});req.on('error',()=>resolve(false));
+  });
+}
+async function guiStatus(){
+  const paths=guiPaths(),current=checkGuiRuntime(paths);
+  if(!current)return {schema:1,id:'openai-bridge',configured:false,endpoint:'',model:'',hasKey:false,localReady:false};
+  const localReady=await guiLocalReady(paths.target,current.instance.port);
+  checkGuiRuntime(paths,current);
+  return {schema:1,id:'openai-bridge',configured:true,endpoint:current.endpoint,model:current.model,hasKey:true,localReady};
+}
+function guiLock(paths,fn){
+  const dir=path.dirname(registration.fileOf(paths.home));
+  fs.mkdirSync(dir,{recursive:true,mode:0o700});
+  const file=path.join(dir,'openai-bridge.lock');
+  if(!exists(file)){
+    const fd=fs.openSync(file,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);fs.closeSync(fd);
+  }
+  return withInstanceLock({home:paths.home},fn);
+}
+async function guiConfigure(input){
+  const paths=guiPaths(),current=checkGuiRuntime(paths);
+  let key=input.apiKey;
+  if(!key){
+    if(!current)throw guiError('KEY_REQUIRED');
+    if(new URL(input.endpoint).origin!==new URL(current.endpoint).origin)throw guiError('KEY_HOST_CHANGED');
+    key=current.apiKey;
+  }
+  let config;try{config=validateConfig({...input,apiKey:key},current?.instance.port||3459);}catch{throw guiError('INVALID_INPUT');}
+  return await guiLock(paths,async checkLock=>{
+    const recheck=previous=>{checkLock();guiPaths();return checkGuiRuntime(paths,previous);};
+    const checked=recheck(current);
+    if(!!checked!==!!current)throw guiError('RUNTIME_CONFLICT');
+    if(!current){
+      await install({dir:paths.target,settings:paths.settings,'bundled-runtime':SOURCE,guiConfig:config,quiet:true,yes:true,
+        guiBeforeDeploy:()=>{if(recheck(null)!==null)throw guiError('RUNTIME_CONFLICT');},
+        guiRegister:(service,target,port)=>{
+          checkLock();if(registration.read(paths.home))throw guiError('RUNTIME_CONFLICT');
+          atomic(registration.fileOf(paths.home),JSON.stringify(registration.value(target,port,service.instanceId),null,2)+'\n');
+        }});
+    }else if(current.endpoint!==config.endpoint||current.model!==config.model||current.apiKey!==config.apiKey){
+      readSettings(paths.settings,true);
+      const nextConfigText=JSON.stringify(routerConfig(config,current.instance.port,current.localKey),null,2)+'\n';
+      const nextConnectionText=JSON.stringify({baseUrl:current.options.endpoint,apiKey:current.localKey,model:config.model},null,2)+'\n';
+      const recoveryFault=path.join(paths.target,'runtime-home/.claude-code-router/recovery.failed'),hadRecoveryFault=exists(recoveryFault);
+      recheck(current);atomic(path.join(paths.target,'disabled'),'configuring\n');
+      // disabled 阻止本安装 Hook/看护重启；只停止已核对的同一服务实例。
+      try{
+        checkLock();checkGuiRuntime(paths,current,true);stopManaged(paths.target);
+        checkLock();checkGuiRuntime(paths,current,true);
+        // 看护可能将本次临时 disabled 记为故障；只清除此操作刚产生的精确标记，不重置既有恢复预算。
+        if(!hadRecoveryFault&&exists(recoveryFault)&&regularFile(recoveryFault)&&fs.readFileSync(recoveryFault,'utf8')==='component removed or disabled\n')fs.rmSync(recoveryFault);
+        atomic(current.configPath,nextConfigText);
+        checkLock();checkInstance(paths.target,current.options,current.instance);
+        atomic(current.connectionPath,nextConnectionText);
+        checkLock();checkGuiRuntime(paths,null,true);
+        fs.rmSync(path.join(paths.target,'disabled'));
+      }catch(error){
+        // 只回滚仍属于同一实例的本次写入；身份变化时保留 tombstone，绝不追着新实例写。
+        try{
+          checkLock();checkInstance(paths.target,current.options,current.instance);
+          regularFile(current.configPath);regularFile(current.connectionPath);
+          const actualConfig=fs.readFileSync(current.configPath,'utf8'),actualConnection=fs.readFileSync(current.connectionPath,'utf8');
+          if(![current.configText,nextConfigText].includes(actualConfig)||![current.connectionText,nextConnectionText].includes(actualConnection))throw guiError('RUNTIME_CONFLICT');
+          atomic(current.configPath,current.configText);atomic(current.connectionPath,current.connectionText);
+          checkGuiRuntime(paths,current,true);fs.rmSync(path.join(paths.target,'disabled'));
+        }catch{}
+        throw error;
+      }
+    }
+    let configured=recheck(null),localReady=false;
+    // 配置落盘不代表远端可用。本机启动失败也保留已保存配置并明确 localReady:false。
+    try{
+      const r=run('bash',[path.join(paths.target,'start-bridge.sh')],{env:cleanEnv(),timeout:70000});
+      configured=recheck(configured);
+      localReady=r.status===0&&await guiLocalReady(paths.target,configured.instance.port);
+    }catch(error){if(error.guiCode)throw error;}
+    recheck(configured);
+    return {schema:1,id:'openai-bridge',configured:true,endpoint:configured.endpoint,model:configured.model,hasKey:true,localReady,connectionPath:configured.connectionPath,...(!localReady?{localError:'LOCAL_START_FAILED'}:{})};
+  });
+}
+async function gui(command,args){
+  process.umask(0o077);
+  scrubGuiEnv();
+  try{
+    if(args.length)throw guiError('INVALID_INPUT');
+    const result=command==='gui-configure'?await guiConfigure(await guiInput()):await guiStatus();
+    console.log(JSON.stringify(result));
+  }catch(error){
+    const code=error.guiCode||(error.message?.includes('正在使用')?'BUSY':'RUNTIME_CONFLICT');
+    console.error(JSON.stringify({schema:1,id:'openai-bridge',error:{code,message:GUI_MESSAGES[code]||GUI_MESSAGES.RUNTIME_CONFLICT}}));process.exitCode=1;
   }
 }
 function purgeTarget(target) {
@@ -342,25 +590,60 @@ function stopManaged(target) {
   const r=run('bash',['-c',script,'bridge-kit-stop',target],{env:cleanEnv(),timeout:30000});
   if(r.status!==0)throw new Error('未能安全停止此安装，文件与钩子均保留：'+r.stderr);
 }
+function uninstallInstance(target,options,instance) {
+  return withInstanceLock(instance,checkLock=>{
+    let registered=true;
+    const recheck=()=>{checkLock();return checkInstance(target,options,instance,registered);};
+    // 交互确认和锁等待后重新核对，后续每个副作用也不能沿用初次读到的注册。
+    recheck();
+    const settings=instance.manifest.settings;
+    readSettings(settings,true);
+    recheck();
+    atomic(path.join(target,'disabled'),'uninstalled\n');
+    recheck();
+    stopManaged(target);
+    const before=readSettings(settings,true),after=removeHook(before,target);
+    recheck();
+    // 已持有注册锁且完整核对 endpoint/port；不可重入旧 unregister 或忽略其 false。
+    fs.unlinkSync(registration.fileOf(instance.home));
+    registered=false;
+    if(!same(before,after)){
+      recheck();
+      if(exists(settings))backup(settings);
+      recheck();
+      if(!same(readSettings(settings,true),before))throw new Error('卸载期间 Claude 设置已变更，未覆盖。');
+      atomic(settings,JSON.stringify(after,null,2)+'\n');
+    }
+    recheck();
+    console.log('已停止并移除本安装的钩子，其他配置未动。');
+    if(options.purge){
+      purgeTarget(target);
+      recheck();
+      fs.rmSync(target,{recursive:true});
+      console.log('已删除整个专用安装目录（含依赖、密钥、配置和日志）：'+target);
+    }else console.log('安装目录和密钥保留：'+target+'；如需永久删除，确认备份后使用 uninstall --yes --purge。');
+  });
+}
 async function manage(command,options) {
+  const scoped=instanceOptions(command,options);
   const target=path.resolve(options.dir||SOURCE);
   const m=loadManifest(target);
+  const instance=scoped?checkInstance(target,options):null;
   if(options.purge){
     if(command!=='uninstall')throw new Error('--purge 只适用于 uninstall。');
     purgeTarget(target);
   }
   if(command==='ensure'){
-    if(!m.service||m.service.schema!==1||m.service.home!==path.resolve(os.homedir())||options.instance!==m.service.instanceId)throw new Error('本地桥实例注册不匹配。');
-    const port=Number(fs.readFileSync(path.join(target,'port'),'utf8').trim());
-    if(options.endpoint!=='http://127.0.0.1:'+port||!registration.check(m.service.home,target,port,m.service.instanceId)||exists(path.join(target,'disabled')))throw new Error('本地桥未注册或已停用。');
-    managedIntact(target,m);
+    if(exists(path.join(target,'disabled')))throw new Error('本地桥未注册或已停用。');
     for(const name of RUNTIME_FILES){
       const expected=path.join(SOURCE,'runtime',name),actual=path.join(target,name);
       if(!exists(expected)||sha(fs.readFileSync(expected))!==sha(fs.readFileSync(actual)))throw new Error('自动启动契约要求匹配的组件与私有运行版本；未执行旧运行脚本。');
     }
+    checkInstance(target,options,instance);
     const r=run('bash',[path.join(target,'start-bridge.sh')],{env:cleanEnv(),timeout:70000});
     if(r.status!==0)throw new Error('本地桥启动失败或恢复次数已达上限，请检查运行状态。');
-    if(!registration.check(m.service.home,target,port,m.service.instanceId)||exists(path.join(target,'disabled')))throw new Error('就绪期间本地桥被停用。');
+    checkInstance(target,options,instance);
+    if(exists(path.join(target,'disabled')))throw new Error('就绪期间本地桥被停用。');
     console.log(JSON.stringify({schema:1,id:'openai-bridge',ready:true,endpoint:options.endpoint,instanceId:m.service.instanceId}));
     return;
   }
@@ -383,6 +666,7 @@ async function manage(command,options) {
     if(r.status!==0)throw new Error('启动失败。');return;
   }
   await confirmStop(target,options);
+  if(command==='uninstall'&&scoped){uninstallInstance(target,options,instance);return;}
   const stoppedHealthy=command==='stop'&&await health(target);
   if(command==='uninstall'){
     readSettings(m.settings,true);
@@ -410,6 +694,7 @@ function parse(argv) {
     const key=argv[i];
     if(!key.startsWith('--'))throw new Error('未知参数：'+key);
     const name=key.slice(2);
+    if(Object.hasOwn(out,name))throw new Error('参数不能重复：'+key);
     if(['yes','start','show-key','help','purge','reset-recovery'].includes(name)){out[name]=true;continue;}
     if(!['dir','settings','config','port','bundled-runtime','endpoint','instance'].includes(name)||!argv[i+1]||argv[i+1].startsWith('--'))throw new Error('未知或缺值的参数：'+key);
     out[name]=argv[++i];
@@ -419,13 +704,14 @@ function parse(argv) {
 async function main() {
   process.umask(0o077);
   const [cmd='install',...argv]=process.argv.slice(2);
+  if(['gui-status','gui-configure'].includes(cmd)){await gui(cmd,argv);return;}
   const options=parse(argv);
   if(options.help){console.log('用法：bash install.sh [--config 私有JSON] [--port 端口] [--dir 安装目录] [--settings 设置路径] [--yes] [--start]\n管理：node manage.cjs status|start|stop|uninstall|connection --dir 安装目录 [--yes] [--show-key] [--purge（仅卸载，永久删除专用目录）]');return;}
   if(!COMMANDS.has(cmd))throw new Error('未知操作：'+cmd);
   if(options.purge&&cmd!=='uninstall')throw new Error('--purge 只适用于 uninstall。');
   if(options['reset-recovery']&&cmd!=='start')throw new Error('--reset-recovery 只适用于 start。');
-  if((options.endpoint||options.instance)&&cmd!=='ensure')throw new Error('--endpoint/--instance 只适用于 ensure。');
+  instanceOptions(cmd,options);
   if(cmd==='install')await install(options);else await manage(cmd,options);
 }
 if(require.main===module)main().catch(e=>{console.error('错误：'+e.message);process.exitCode=1;});
-module.exports={atomic,mergeHook,removeHook,validateConfig,routerConfig,readSettings,safeTarget,hookEntry,legacyHookEntry,parse,quote,copyBundledRuntime,purgeTarget};
+module.exports={atomic,mergeHook,removeHook,validateConfig,routerConfig,readSettings,safeTarget,hookEntry,legacyHookEntry,parse,quote,copyBundledRuntime,purgeTarget,instanceOptions};
