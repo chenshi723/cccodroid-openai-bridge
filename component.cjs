@@ -17,12 +17,14 @@ try{
     run(path.join(__dirname,'runtime/selftest.cjs'),[]);
   }else if(command==='help'||command==='--help'){
     console.log('openai-bridge --selftest | configure | start | status | stop --yes | uninstall --yes [--purge]\n--purge 会永久删除整个专用目录，含密钥和日志，须另行确认。\nconfigure 请用户自己在终端输入端点和密钥；安全修复范围与未完成的发布验证见源仓库 SECURITY.md。');
-  }else if(['configure','start','status','stop','uninstall'].includes(command)){
+  }else if(['configure','start','ensure','status','stop','uninstall'].includes(command)){
     const options=api.parse(args);
     if(options['show-key']||options['bundled-runtime'])throw new Error('组件入口不允许此参数。');
     if(options.purge&&command!=='uninstall')throw new Error('--purge 只适用于 uninstall。');
     if(command==='configure'){
       run(path.join(__dirname,'installer.cjs'),['install',...args,'--bundled-runtime',__dirname]);
+    }else if(command==='ensure'){
+      run(path.join(__dirname,'installer.cjs'),['ensure',...args]);
     }else{
       const target=path.resolve(options.dir||path.join(os.homedir(),'.local/share/ccr-bridge-kit'));
       const marker=path.join(target,'.ccr-bridge-kit.json');

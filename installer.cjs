@@ -11,12 +11,13 @@ const {spawnSync} = require('node:child_process');
 const readline = require('node:readline/promises');
 const {Writable} = require('node:stream');
 
-const VERSION = '1.0.4';
+const VERSION = '1.0.5';
 const CCR_VERSION = '1.0.73';
 const MARKER = '.ccr-bridge-kit.json';
 const SOURCE = __dirname;
-const RUNTIME_FILES = ['bridge-common.sh','start-bridge.sh','watchdog.sh','patch-ccr.js','health.cjs'];
-const COMMANDS = new Set(['install','status','start','stop','uninstall','connection']);
+const RUNTIME_FILES = ['bridge-common.sh','start-bridge.sh','watchdog.sh','patch-ccr.js','health.cjs','service-registration.cjs'];
+const registration = require(exists(path.join(SOURCE,'service-registration.cjs'))?'./service-registration.cjs':'./runtime/service-registration.cjs');
+const COMMANDS = new Set(['install','status','start','ensure','stop','uninstall','connection']);
 const sha = data => crypto.createHash('sha256').update(data).digest('hex');
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 
@@ -47,7 +48,7 @@ function run(command,args,options={}) {
 }
 function checkTools(bundled) {
   if(Number(process.versions.node.split('.')[0])<22)throw new Error('需要 Node.js 22 或更新版本。');
-  const tools=['flock','setsid','timeout','readlink','tee'];
+  const tools=['flock','setsid','timeout','readlink','tee','base64'];
   if(!bundled)tools.push('npm');
   const r=run('bash',['-c','for x in "$@"; do command -v "$x" >/dev/null || { printf "missing: %s\\n" "$x"; exit 1; }; done; [[ ${BASH_VERSINFO[0]} -ge 4 ]]','bridge-tools',...tools]);
   if(r.status!==0)throw new Error('缺少运行依赖（Bash 4+、flock、setsid、timeout 等）：'+r.stdout+r.stderr);
@@ -239,6 +240,8 @@ async function install(options) {
     if(m.settings!==settings)throw new Error('重复安装不能更换 settings 路径。');
     if(options.config||options.port)throw new Error('重复安装不会覆盖现有密钥/端口；如需重配，请先卸载并备份自己的配置。');
     const original=readSettings(settings),merged=mergeHook(original,target);
+    if(m.service){registration.register(m.service.home,target,Number(fs.readFileSync(path.join(target,'port'),'utf8').trim()),m.service.instanceId);}
+    fs.rmSync(path.join(target,'disabled'),{force:true});
     if(!same(original,merged)){if(exists(settings))backup(settings);atomic(settings,JSON.stringify(merged,null,2)+'\n');}
     console.log('已安装，文件与配置均未覆盖。');
     showConnection(target);
@@ -247,6 +250,8 @@ async function install(options) {
   }
   const original=readSettings(settings);
   mergeHook(original,target); // 提前验证已有 hook，不要装到一半才发现冲突。
+  const service=bundled?{schema:1,home:path.resolve(os.homedir()),instanceId:crypto.randomBytes(16).toString('hex')}:null;
+  if(service&&registration.read(service.home))throw new Error('已有本地桥服务注册，未覆盖；请先处理原安装。');
   let port=options.port===undefined?undefined:Number(options.port);
   let config;
   if(options.config){
@@ -298,8 +303,9 @@ async function install(options) {
     if(!same(current,original))throw new Error('安装期间 Claude 设置被其他程序修改，已停止，未覆盖。');
     const merged=mergeHook(current,target);
     const saved=exists(settings)?backup(settings):null;
-    atomic(path.join(stage,MARKER),JSON.stringify({id:'ccr-bridge-kit',version:VERSION,target,settings,settingsBackup:saved,componentEntry:path.join(SOURCE,'component.cjs'),hook:hookEntry(target),files},null,2)+'\n');
+    atomic(path.join(stage,MARKER),JSON.stringify({id:'ccr-bridge-kit',version:VERSION,target,settings,settingsBackup:saved,componentEntry:path.join(SOURCE,'component.cjs'),hook:hookEntry(target),service,files},null,2)+'\n');
     fs.renameSync(stage,target);deployed=true;
+    if(service)registration.register(service.home,target,port,service.instanceId);
     try{atomic(settings,JSON.stringify(merged,null,2)+'\n');}
     catch(e){throw new Error('安装文件已保留，但钩子写入失败；修正权限后重新执行安装器即可。'+e.message);}
     console.log('安装完成；已合并 SessionStart 钩子，未修改客户端全局认证。');
@@ -343,20 +349,49 @@ async function manage(command,options) {
     if(command!=='uninstall')throw new Error('--purge 只适用于 uninstall。');
     purgeTarget(target);
   }
+  if(command==='ensure'){
+    if(!m.service||m.service.schema!==1||m.service.home!==path.resolve(os.homedir())||options.instance!==m.service.instanceId)throw new Error('本地桥实例注册不匹配。');
+    const port=Number(fs.readFileSync(path.join(target,'port'),'utf8').trim());
+    if(options.endpoint!=='http://127.0.0.1:'+port||!registration.check(m.service.home,target,port,m.service.instanceId)||exists(path.join(target,'disabled')))throw new Error('本地桥未注册或已停用。');
+    managedIntact(target,m);
+    for(const name of RUNTIME_FILES){
+      const expected=path.join(SOURCE,'runtime',name),actual=path.join(target,name);
+      if(!exists(expected)||sha(fs.readFileSync(expected))!==sha(fs.readFileSync(actual)))throw new Error('自动启动契约要求匹配的组件与私有运行版本；未执行旧运行脚本。');
+    }
+    const r=run('bash',[path.join(target,'start-bridge.sh')],{env:cleanEnv(),timeout:70000});
+    if(r.status!==0)throw new Error('本地桥启动失败或恢复次数已达上限，请检查运行状态。');
+    if(!registration.check(m.service.home,target,port,m.service.instanceId)||exists(path.join(target,'disabled')))throw new Error('就绪期间本地桥被停用。');
+    console.log(JSON.stringify({schema:1,id:'openai-bridge',ready:true,endpoint:options.endpoint,instanceId:m.service.instanceId}));
+    return;
+  }
   if(command==='connection'){showConnection(target,options['show-key']);return;}
   if(command==='status'){
     console.log('安装版本：'+m.version+' / CCR '+CCR_VERSION);
     console.log('本地 HTTP 健康：'+(await health(target)?'正常（不代表上游推理成功）':'未运行或未就绪'));
+    const fault=path.join(target,'runtime-home','.claude-code-router','recovery.failed');
+    if(exists(fault))console.log('自动恢复：已停止（达到有限恢复上限）；排查后由使用者显式 start --reset-recovery。');
     showConnection(target);return;
   }
   if(command==='start'){
+    if(exists(path.join(target,'disabled')))throw new Error('此安装已卸载停用，请先重新 configure。');
+    if(options['reset-recovery']){
+      if(!options.yes)throw new Error('重置恢复预算需要 --yes。');
+      stopManaged(target);
+      for(const name of ['recovery.failed','recovery.attempts'])fs.rmSync(path.join(target,'runtime-home','.claude-code-router',name),{force:true});
+    }
     const r=run('bash',[path.join(target,'start-bridge.sh')],{env:cleanEnv(),timeout:110000,stdio:'inherit'});
     if(r.status!==0)throw new Error('启动失败。');return;
   }
   await confirmStop(target,options);
-  if(command==='uninstall')readSettings(m.settings,true);
+  const stoppedHealthy=command==='stop'&&await health(target);
+  if(command==='uninstall'){
+    readSettings(m.settings,true);
+    atomic(path.join(target,'disabled'),'uninstalled\n');
+    if(m.service)registration.unregister(m.service.home,target,m.service.instanceId);
+  }
   stopManaged(target);
   if(command==='stop'){
+    if(stoppedHealthy)fs.rmSync(path.join(target,'runtime-home','.claude-code-router','recovery.attempts'),{force:true});
     console.log('已停止；SessionStart 钩子仍在，下次会话会重新启动。永久停用请卸载。');return;
   }
   const before=readSettings(m.settings,true);
@@ -375,8 +410,8 @@ function parse(argv) {
     const key=argv[i];
     if(!key.startsWith('--'))throw new Error('未知参数：'+key);
     const name=key.slice(2);
-    if(['yes','start','show-key','help','purge'].includes(name)){out[name]=true;continue;}
-    if(!['dir','settings','config','port','bundled-runtime'].includes(name)||!argv[i+1]||argv[i+1].startsWith('--'))throw new Error('未知或缺值的参数：'+key);
+    if(['yes','start','show-key','help','purge','reset-recovery'].includes(name)){out[name]=true;continue;}
+    if(!['dir','settings','config','port','bundled-runtime','endpoint','instance'].includes(name)||!argv[i+1]||argv[i+1].startsWith('--'))throw new Error('未知或缺值的参数：'+key);
     out[name]=argv[++i];
   }
   return out;
@@ -388,6 +423,8 @@ async function main() {
   if(options.help){console.log('用法：bash install.sh [--config 私有JSON] [--port 端口] [--dir 安装目录] [--settings 设置路径] [--yes] [--start]\n管理：node manage.cjs status|start|stop|uninstall|connection --dir 安装目录 [--yes] [--show-key] [--purge（仅卸载，永久删除专用目录）]');return;}
   if(!COMMANDS.has(cmd))throw new Error('未知操作：'+cmd);
   if(options.purge&&cmd!=='uninstall')throw new Error('--purge 只适用于 uninstall。');
+  if(options['reset-recovery']&&cmd!=='start')throw new Error('--reset-recovery 只适用于 start。');
+  if((options.endpoint||options.instance)&&cmd!=='ensure')throw new Error('--endpoint/--instance 只适用于 ensure。');
   if(cmd==='install')await install(options);else await manage(cmd,options);
 }
 if(require.main===module)main().catch(e=>{console.error('错误：'+e.message);process.exitCode=1;});

@@ -11,6 +11,7 @@ const assert=require('node:assert/strict');
 const sourceKit=process.env.OPENAI_BRIDGE_TEST_SOURCE?path.resolve(process.env.OPENAI_BRIDGE_TEST_SOURCE):path.resolve(__dirname,'..');
 let kit=sourceKit;
 const bundled=process.argv.includes('--bundled');
+let testEnv;
 function exec(args,opts={}){
   if(bundled){
     const [action,...rest]=args;
@@ -20,7 +21,7 @@ function exec(args,opts={}){
 }
 function command(bin,args,opts={}){
   return new Promise((resolve,reject)=>{
-    const p=spawn(bin,args,{env:process.env,...opts});
+    const p=spawn(bin,args,{...opts,env:{...testEnv,...opts.env}});
     let stdout='',stderr='';
     p.stdout.on('data',b=>stdout+=b);p.stderr.on('data',b=>stderr+=b);
     const timer=setTimeout(()=>{p.kill('SIGKILL');reject(Error('installer timed out'));},360000);
@@ -32,6 +33,9 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
   const sourceCli=path.join(sourceKit,'node_modules/@musistudio/claude-code-router/dist/cli.js');
   const sourceBytes=fs.readFileSync(sourceCli),sourceStat=fs.statSync(sourceCli);
   const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'kit-e2e-'));
+  const home=path.join(tmp,'client-home');fs.mkdirSync(home);
+  testEnv={...process.env,HOME:home,CCR_BRIDGE_START_TIMEOUT:'30'};
+  for(const k of Object.keys(testEnv))if(k.startsWith('CCAPP_')||k.startsWith('ANTHROPIC_')||k.startsWith('CLAUDE_'))delete testEnv[k];
   kit=path.join(tmp,'component-source');fs.mkdirSync(kit);
   for(const file of ['installer.cjs','component.cjs','package.json','package-lock.json','LICENSE','LICENSE-CCR.txt','README.md']){
     const from=path.join(sourceKit,file);if(fs.existsSync(from))fs.copyFileSync(from,path.join(kit,file));
@@ -76,15 +80,40 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert.equal(merged.hooks.SessionStart[1].matcher,'startup|resume');
     assert.match(merged.hooks.SessionStart[1].hooks[0].command,/start-bridge\.sh' --hook$/);
     console.log('PASS private generated key/config, unrelated settings preserved');
+    const serviceFile=path.join(home,'.cccodroid/services/openai-bridge.json');
+    let service;
+    if(bundled){
+      service=JSON.parse(fs.readFileSync(serviceFile,'utf8'));
+      assert.equal(service.endpoint,connection.baseUrl);assert.equal(service.runtimeDir,target);
+      assert.equal(Object.keys(service).length,5);assert.match(service.instanceId,/^[0-9a-f]{32}$/);
+      assert.equal(fs.statSync(serviceFile).mode&0o777,0o600);
+    }else assert.equal(fs.existsSync(serviceFile),false);
     for(const url of ['', 'https://api.anthropic.com', connection.baseUrl+'@elsewhere.invalid', connection.baseUrl+'.evil.invalid']){
-      const foreign=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:url}});
+      const foreign=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...testEnv,ANTHROPIC_BASE_URL:url}});
       assert.equal(foreign.status,0,foreign.stderr);
       assert.equal(fs.existsSync(path.join(state,'watchdog.pid')),false);
       assert.equal(fs.existsSync(path.join(state,'.claude-code-router.pid')),false);
     }
     console.log('PASS foreign/empty endpoint cold Hooks do not start any bridge or watchdog');
+    if(bundled){
+      const ensure=['ensure','--dir',target,'--endpoint',service.endpoint,'--instance',service.instanceId];
+      const bad=await exec([...ensure.slice(0,-1),'0'.repeat(32)]);
+      assert.notEqual(bad.status,0);assert.equal(fs.existsSync(path.join(state,'watchdog.pid')),false);
+      const results=await Promise.all(Array.from({length:4},()=>exec(ensure)));
+      for(const rr of results){assert.equal(rr.status,0,rr.stderr);assert.deepEqual(JSON.parse(rr.stdout),{schema:1,id:'openai-bridge',ready:true,endpoint:service.endpoint,instanceId:service.instanceId});}
+      assert.equal((await fetch(connection.baseUrl+'/health')).status,200);
+      r=await exec(['stop','--dir',target,'--yes']);assert.equal(r.status,0,r.stderr);
+      assert.equal(await fetch(connection.baseUrl+'/health').then(()=>true,()=>false),false);
+      fs.writeFileSync(path.join(state,'recovery.failed'),'fixture fault\n');
+      const faulted=await exec(ensure);assert.notEqual(faulted.status,0);
+      r=await exec(['start','--dir',target,'--reset-recovery','--yes']);assert.equal(r.status,0,r.stderr);
+      assert.equal(fs.existsSync(path.join(state,'recovery.failed')),false);
+      r=await exec(['stop','--dir',target,'--yes']);assert.equal(r.status,0,r.stderr);
+      console.log('PASS registered ensure rejects wrong instance, waits for concurrent cold start and requires explicit recovery reset');
+    }
     const started=Date.now();
-    r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:connection.baseUrl+'/v1'}});
+    const appBaseUrl='http://127.0.0.1:45000/u/'+'0'.repeat(32)+'/'+Buffer.from(connection.baseUrl+'/v1').toString('base64url');
+    r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...testEnv,ANTHROPIC_BASE_URL:appBaseUrl}});
     assert.equal(r.status,0,r.stdout+r.stderr);assert.ok(Date.now()-started<3000,'Hook must not wait for readiness');
     let ready=false;
     for(let i=0;i<100;i++){
@@ -92,7 +121,7 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
       if(ready)break;await new Promise(resolve=>setTimeout(resolve,100));
     }
     assert.equal(ready,true,'real CCR did not become ready after cold Hook');
-    console.log('PASS matching cold Hook returns promptly and real patched CCR starts asynchronously');
+    console.log('PASS App-streamfix-wrapped cold Hook returns promptly and real patched CCR starts asynchronously');
     const response=await fetch(connection.baseUrl+'/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':connection.apiKey},body:JSON.stringify({model:'test-model',max_tokens:32,stream:true,messages:[{role:'user',content:'local test'}]})});
     const body=await response.text();
     assert.equal(response.status,200,body);assert(body.includes('KIT_LOCAL_TEST_OK'),body);assert(body.includes('message_stop'));
@@ -112,6 +141,11 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert.equal(r.status,0,r.stderr);installed=false;
     assert.deepEqual(JSON.parse(fs.readFileSync(settings)),original);
     assert(fs.existsSync(path.join(target,'connection.json')));
+    assert(fs.existsSync(path.join(target,'disabled')));
+    if(bundled){
+      assert.equal(fs.existsSync(serviceFile),false);
+      const denied=await exec(['ensure','--dir',target,'--endpoint',service.endpoint,'--instance',service.instanceId]);assert.notEqual(denied.status,0);
+    }
     const health=await fetch(connection.baseUrl+'/health').then(()=>true,()=>false);assert.equal(health,false);
     console.log('PASS uninstall stops only isolated runtime, removes own hook, preserves data');
     // Simulate App removing the component entry while leaving the private runtime and Hook.
@@ -120,7 +154,7 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert.equal(manifest.componentEntry,componentEntry);
     fs.renameSync(componentEntry,removedEntry);
     try{
-      r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:connection.baseUrl}});
+      r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...testEnv,ANTHROPIC_BASE_URL:connection.baseUrl}});
       assert.equal(r.status,0,r.stdout+'\n'+r.stderr);
       assert.match(fs.readFileSync(path.join(state,'start.log'),'utf8'),/组件已卸载|入口不存在/);
       assert.equal(await fetch(connection.baseUrl+'/health').then(()=>true,()=>false),false);
@@ -141,7 +175,7 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     console.log('PASS source dependency bytes, inode and mtime remain unchanged');
     console.log('PASS all installer end-to-end checks');
   }finally{
-    if(installed){const r=await exec(['stop','--dir',target,'--yes']);if(r.status!==0)console.error('cleanup stop failed:',r.stderr);}
+    if(installed){const r=await exec(['uninstall','--dir',target,'--yes']);if(r.status!==0)console.error('cleanup uninstall failed:',r.stderr);}
     await new Promise(r=>upstream.close(r));
     // 所有进程已停止，清理只属于本测试的临时目录。
     fs.rmSync(tmp,{recursive:true,force:true});
