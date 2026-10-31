@@ -9,12 +9,14 @@ const {spawnSync} = require('node:child_process');
 const source = path.resolve(__dirname, '..');
 
 async function worker(cli, fixed) {
-  const {fastify, staticPlugin, undici} = require(cli);
+  const {fastify, staticPlugin, undici, glob, minimatch} = require(cli);
   if (fixed) {
     assert.equal(fastify, require('fastify'));
     assert.equal(staticPlugin, require('@fastify/static'));
     assert.equal(undici, require('undici'));
-    console.log('PASS patched bundle loads the exact fixed Fastify/static/Undici implementations');
+    assert.equal(glob, require('glob'));
+    assert.equal(minimatch, require('minimatch'));
+    console.log('PASS patched bundle loads the exact fixed Fastify/static/Undici/glob/minimatch implementations');
   }
   const root = path.join(path.dirname(cli), 'static-test');
   fs.mkdirSync(path.join(root, 'public'), {recursive:true});
@@ -45,6 +47,41 @@ async function worker(cli, fixed) {
   } finally { await app.close(); }
   if (!fixed) return;
 
+  const tree = path.join(root, 'glob-tree');
+  const makeTree = (dir, depth) => {
+    fs.mkdirSync(dir, {recursive:true});fs.writeFileSync(path.join(dir, 'ok.txt'), 'FAKE');
+    if (depth) for (const name of ['a','b']) makeTree(path.join(dir, name), depth - 1);
+  };
+  makeTree(tree, 3);
+  assert.equal((await glob.glob('**/*.txt', {cwd:tree})).length, 15);
+  for (const stream of [false, true]) {
+    const ac = new AbortController(), reason = new Error('test-abort');
+    let reads = 0;
+    const count = () => { if (++reads === 1) ac.abort(reason); };
+    const countedFs = {...fs, readdir(...args) { count();return fs.readdir(...args); }, readdirSync(...args) { count();return fs.readdirSync(...args); }};
+    const options = {cwd:tree, signal:ac.signal, fs:countedFs};
+    if (stream) await assert.rejects(async () => { for await (const _ of glob.globStream('**', options)) {} }, error => error === reason);
+    else await assert.rejects(glob.glob('**', options), error => error === reason);
+    const atReject = reads;
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(reads, 1);assert.equal(reads, atReject);
+  }
+  console.log('PASS glob 14.0.3 promise/stream abort stops directory reads on a bounded fake tree');
+  const small = new minimatch.Minimatch('**/../a/b/**/../c/d', {optimizationLevel:2});
+  assert.equal(small.set.length, 4);assert(small.match('../a/b/../c/d'));assert(small.match('x/a/b/y/c/d'));
+  const capped = new minimatch.Minimatch(Array(8).fill('**/../a/b').join('/'), {optimizationLevel:2, braceExpandMax:16});
+  assert.equal(capped.set.length, 16);
+  const many = new minimatch.Minimatch('{x,*}/{0..500}', {optimizationLevel:2});
+  assert.equal(many.set.length, 1002);assert(many.match('x/5'));assert(many.match('y/500'));assert.equal(many.match('.y/5'), false);
+  console.log('PASS minimatch 11.0.3 caps optimization expansion and skips large-set pairwise deduplication');
+
+  const listed = fastify({logger:false});
+  listed.register(staticPlugin, {root, index:false, list:{format:'json'}});
+  try {
+    const listing = await listed.inject('/public/');
+    assert.equal(listing.statusCode, 200);assert.match(listing.body, /ok\.txt/);
+    console.log('PASS fixed static directory listing works with glob 14.0.3');
+  } finally { await listed.close(); }
   const guarded = fastify({logger:false});
   guarded.get('/private/*', async (_, reply) => reply.code(403).send('DENIED'));
   guarded.register(staticPlugin, {root, list:{format:'json'}});
@@ -89,7 +126,7 @@ async function main() {
         console.log('PASS all 249 affected embedded CommonJS modules removed; fixed dependencies are loaded externally');
       }
       assert.equal(text.split('main().catch(console.error);').length, 2);
-      fs.writeFileSync(cli, text.replace('main().catch(console.error);', 'module.exports = { fastify: require_fastify(), staticPlugin: import_static.default, undici: require_undici() };'));
+      fs.writeFileSync(cli, text.replace('main().catch(console.error);', 'module.exports = { fastify: require_fastify(), staticPlugin: import_static.default, undici: require_undici(), glob: require_commonjs7(), minimatch: require_commonjs3() };'));
       const result = spawnSync(process.execPath, [__filename, '--worker', cli, String(fixed)], {env, encoding:'utf8', timeout:20000});
       assert.equal(result.status, 0, result.stdout + result.stderr);
       process.stdout.write(result.stdout);
@@ -111,8 +148,10 @@ async function main() {
     for (const [name, pkg] of Object.entries(lock.packages)) {
       if (name.endsWith('/tmp')) assert.equal(pkg.version, '0.2.7');
       if (name.endsWith('/@fastify/static')) assert.equal(pkg.version, '10.1.2');
+      if (name.endsWith('/glob')) assert.equal(pkg.version, '14.0.3');
+      if (name.endsWith('/minimatch')) assert.equal(pkg.version, '11.0.3');
     }
-    console.log('PASS lockfile contains no nested old static/tmp version');
+    console.log('PASS lockfile contains no nested old static/tmp/glob/minimatch version');
   } finally { fs.rmSync(temp, {recursive:true, force:true}); }
 }
 
