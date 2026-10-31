@@ -198,8 +198,8 @@ function wrapper(target,command) {
 function loadManifest(target) {
   const p=path.join(target,MARKER);
   if(!exists(p))throw new Error('该目录不是由本安装器管理的安装：'+target);
-  const m=json(p);
-  if(m.id!=='ccr-bridge-kit'||m.version!==VERSION||path.resolve(m.target)!==target)throw new Error('安装标记不匹配，拒绝操作。');
+  const m=JSON.parse(instanceFile(p,65536).data);
+  if(!object(m)||m.id!=='ccr-bridge-kit'||m.version!==VERSION||typeof m.target!=='string'||path.resolve(m.target)!==target)throw new Error('安装标记不匹配，拒绝操作。');
   return m;
 }
 function managedIntact(target,m) {
@@ -222,50 +222,121 @@ function regularFile(file) {
   return st;
 }
 function sameFile(a,b) { return a.dev===b.dev&&a.ino===b.ino; }
+function instanceDirectory(dir) {
+  const st=fs.lstatSync(dir);
+  if(!st.isDirectory()||fs.realpathSync(dir)!==dir)throw new Error('实例目录或父路径不规范，拒绝操作。');
+  return st;
+}
+function openInstanceDirectory(dir) {
+  const st=instanceDirectory(dir),fd=fs.openSync(dir,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
+  const check=()=>{
+    if(!sameFile(st,fs.fstatSync(fd))||!sameFile(st,instanceDirectory(dir)))throw new Error('操作期间实例目录已变更。');
+  };
+  try{check();return {fd,stat:st,at:name=>'/proc/self/fd/'+fd+'/'+name,check};}
+  catch(error){fs.closeSync(fd);throw error;}
+}
+function instanceFile(file,limit=1024*1024) {
+  // 有界读取且拒绝 FIFO、链接和读取期间的替换；目录 FD 防止中间父路径被换成链接。
+  const dir=openInstanceDirectory(path.dirname(file));let fd;
+  try{
+    const at=dir.at(path.basename(file)),original=regularFile(at);
+    if(original.nlink!==1||original.size>limit)throw new Error('实例元数据过大或存在硬链接。');
+    fd=fs.openSync(at,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
+    const st=fs.fstatSync(fd);
+    if(!st.isFile()||st.nlink!==1||!sameFile(st,original)||st.size>limit)throw new Error('实例元数据已变更。');
+    const buffer=Buffer.alloc(limit+1);let size=0,n;
+    while(size<buffer.length&&(n=fs.readSync(fd,buffer,size,buffer.length-size,null))>0)size+=n;
+    const after=fs.fstatSync(fd);
+    dir.check();
+    if(size>limit||!sameFile(st,regularFile(at))||st.size!==after.size||st.mtimeMs!==after.mtimeMs||st.ctimeMs!==after.ctimeMs)throw new Error('实例元数据过大或读取期间已变更。');
+    return {data:buffer.subarray(0,size),stat:st};
+  }finally{if(fd!==undefined)fs.closeSync(fd);fs.closeSync(dir.fd);}
+}
+function instancePort(target) {
+  const text=instanceFile(path.join(target,'port'),6).data.toString('utf8'),port=Number(text);
+  if(!Number.isInteger(port)||port<1024||port>65535||(text!==String(port)&&text!==String(port)+'\n'))throw new Error('实例端口不是规范整数。');
+  return port;
+}
+function instancePid(file) {
+  if(!exists(file))return null;
+  const text=instanceFile(file,16).data.toString('utf8'),pid=Number(text);
+  if(!/^[1-9][0-9]*\n?$/.test(text)||!Number.isSafeInteger(pid)||pid<=1||pid>2147483647)throw new Error('实例 PID 元数据不合法。');
+  return pid;
+}
+function stopMetadata(target) {
+  const dirs=[target,path.join(target,'runtime-home'),path.join(target,'runtime-home/.claude-code-router')];
+  const stats=dirs.map(instanceDirectory),state=dirs[2];
+  for(const name of ['start.lock','service.lock','watchdog.lock'])if(exists(path.join(state,name))){
+    const st=regularFile(path.join(state,name));
+    if(st.nlink!==1)throw new Error('实例锁存在硬链接，拒绝操作。');
+  }
+  for(const name of ['watchdog.pid','.claude-code-router.pid'])instancePid(path.join(state,name));
+  if(exists(path.join(target,'disabled')))instanceFile(path.join(target,'disabled'),32);
+  return {state,stats};
+}
 function checkInstance(target,options,previous=null,registered=true) {
-  // App 的卸载授权仅属于完整匹配的注册实例；不读 connection/config 或任何密钥。
-  const targetStat=fs.lstatSync(target);
-  if(!targetStat.isDirectory()||fs.realpathSync(target)!==target)throw new Error('实例目录或父路径不规范，拒绝操作。');
-  regularFile(path.join(target,MARKER));
-  const m=loadManifest(target),service=m.service,home=path.resolve(os.homedir());
-  if(m.target!==target||!object(service)||service.schema!==1||service.home!==home||fs.realpathSync(home)!==home||service.instanceId!==options.instance)throw new Error('本地桥实例注册不匹配。');
-  regularFile(path.join(target,'port'));
-  const portText=fs.readFileSync(path.join(target,'port'),'utf8'),port=Number(portText);
-  if(!Number.isInteger(port)||(portText!==String(port)&&portText!==String(port)+'\n'))throw new Error('实例端口不是规范整数。');
-  if(port<1024||port>65535||options.endpoint!=='http://127.0.0.1:'+port)throw new Error('本地桥 endpoint 与实例端口不匹配。');
+  // 私有 manifest 不是信任根：组件源、私有文件的实际 hash、manifest 三方必须相符。
+  // 固定文件白名单也避免恶意清单引导读取 connection/config 或任意用户文件。
+  const targetStat=instanceDirectory(target),m=JSON.parse(instanceFile(path.join(target,MARKER),65536).data),home=path.resolve(os.homedir());
+  const service=m?.service;
+  if(m?.id!=='ccr-bridge-kit'||m.version!==VERSION||m.target!==target||!object(service)||service.schema!==1||service.home!==home||fs.realpathSync(home)!==home||service.instanceId!==options.instance)throw new Error('本地桥实例注册不匹配。');
+  const port=instancePort(target);
+  if(options.endpoint!=='http://127.0.0.1:'+port)throw new Error('本地桥 endpoint 与实例端口不匹配。');
   if(typeof m.settings!=='string'||!path.isAbsolute(m.settings)||path.resolve(m.settings)!==m.settings)throw new Error('实例设置路径不规范。');
   safeTarget(target,m.settings);
-  const registryDir=path.dirname(registration.fileOf(home));
-  if(fs.realpathSync(registryDir)!==registryDir)throw new Error('服务注册目录或父路径不规范。');
-  const matches=registered?registration.check(home,target,port,service.instanceId):registration.read(home)===null;
-  if(!matches)throw new Error('本地桥服务注册已变更，拒绝操作。');
-  if(!object(m.files)||!Object.hasOwn(m.files,'bridge-common.sh')||!Object.hasOwn(m.files,'port'))throw new Error('实例缺少受管理的运行文件。');
-  for(const [name,hash] of Object.entries(m.files)){
-    if(path.basename(name)!==name||name==='.'||name==='..'||typeof hash!=='string'||!/^[0-9a-f]{64}$/.test(hash))throw new Error('实例运行文件清单不合法。');
-    regularFile(path.join(target,name));
+  const registryFile=registration.fileOf(home),registryDir=path.dirname(registryFile);
+  instanceDirectory(registryDir);
+  const current=exists(registryFile)?JSON.parse(instanceFile(registryFile,4096).data):null;
+  const expected=registration.value(target,port,service.instanceId);
+  if(registered?(!object(current)||Object.keys(current).length!==5||!Object.keys(expected).every(k=>current[k]===expected[k])):current!==null)throw new Error('本地桥服务注册已变更，拒绝操作。');
+  const allowed=new Set([...RUNTIME_FILES,'manage.cjs','stop.sh','uninstall.sh','status.sh','package.json','package-lock.json','port']);
+  if(!object(m.files)||[...RUNTIME_FILES,'port'].some(name=>!Object.hasOwn(m.files,name)))throw new Error('实例缺少受管理的运行文件。');
+  const sources={};
+  for(const name of Object.keys(m.files).sort()){
+    const hash=m.files[name];
+    if(!allowed.has(name)||typeof hash!=='string'||!/^[0-9a-f]{64}$/.test(hash))throw new Error('实例运行文件清单不合法。');
+    const actual=instanceFile(path.join(target,name));
+    if(sha(actual.data)!==hash)throw new Error('实例运行文件被修改，拒绝操作。');
+    if(RUNTIME_FILES.includes(name)){
+      const source=instanceFile(path.join(SOURCE,'runtime',name));
+      if(sha(source.data)!==hash)throw new Error('实例运行文件与固定组件不匹配；未执行私有代码。');
+      sources[name]={hash,dev:source.stat.dev,ino:source.stat.ino,privateDev:actual.stat.dev,privateIno:actual.stat.ino};
+    }
   }
-  managedIntact(target,m);
-  if(previous&&(!sameFile(previous.targetStat,targetStat)||!same(previous.manifest,m)||previous.port!==port))throw new Error('操作期间实例元数据已变更。');
-  return {target,home,port,manifest:m,targetStat};
+  const runtime=stopMetadata(target);
+  if(previous&&(!sameFile(previous.targetStat,targetStat)||!same(previous.manifest,m)||previous.port!==port||!same(previous.sources,sources)||runtime.stats.some((st,i)=>!sameFile(st,previous.runtime.stats[i]))))throw new Error('操作期间实例元数据已变更。');
+  return {target,home,port,manifest:m,targetStat,sources,runtime};
+}
+function openInstanceLock(file,create=false,guard=()=>{}) {
+  const dir=openInstanceDirectory(path.dirname(file));let fd;
+  try{
+    guard();const at=dir.at(path.basename(file)),original=exists(at)?regularFile(at):null;
+    if(original&&original.nlink!==1)throw new Error('实例锁存在硬链接，拒绝操作。');
+    const flags=fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK;
+    // 不使用 shell 重定向、append 或 O_TRUNC；不存在时只允许排他创建。
+    if(!original&&!create)throw new Error('实例锁不存在，拒绝操作。');
+    guard();dir.check();
+    fd=fs.openSync(at,flags|(original?0:fs.constants.O_CREAT|fs.constants.O_EXCL),0o600);
+    const st=fs.fstatSync(fd);
+    const check=()=>{
+      dir.check();const now=regularFile(file);
+      if(!st.isFile()||st.nlink!==1||(original&&!sameFile(original,st))||!sameFile(st,fs.fstatSync(fd))||!sameFile(st,now)||now.nlink!==1)throw new Error('操作期间实例锁已变更。');
+    };
+    check();guard();
+    return {fd,check,close(){fs.closeSync(fd);fs.closeSync(dir.fd);}};
+  }catch(error){if(fd!==undefined)fs.closeSync(fd);fs.closeSync(dir.fd);throw error;}
 }
 function withInstanceLock(instance,fn) {
-  // 使用 registration.register/unregister 的同一把锁，但绝不为无效实例创建锁或目录。
-  const file=path.join(path.dirname(registration.fileOf(instance.home)),'openai-bridge.lock');
-  const original=regularFile(file);
-  const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
-  const check=()=>{
-    if(!sameFile(original,fs.fstatSync(fd))||!sameFile(original,regularFile(file)))throw new Error('操作期间服务注册锁已变更。');
-  };
+  // 与 register/unregister 同一把锁；无效实例不创建锁或目录，锁一直保留到异步副作用结束。
+  const file=path.join(path.dirname(registration.fileOf(instance.home)),'openai-bridge.lock'),lock=openInstanceLock(file);
+  let closed=false;const close=()=>{if(!closed){closed=true;lock.close();}};
   try{
-    check();
-    const r=run('flock',['-w','5','3'],{stdio:['ignore','ignore','pipe',fd],timeout:6000});
+    const r=run('flock',['-w','5','3'],{stdio:['ignore','ignore','pipe',lock.fd],timeout:6000});
     if(r.status!==0)throw new Error('服务注册正在使用，未修改。');
-    check();
-    const result=fn(check);
-    if(result&&typeof result.then==='function')return result.finally(()=>fs.closeSync(fd));
-    fs.closeSync(fd);
-    return result;
-  }catch(error){fs.closeSync(fd);throw error;}
+    lock.check();const result=fn(lock.check);
+    if(result&&typeof result.then==='function')return result.finally(close);
+    close();return result;
+  }catch(error){close();throw error;}
 }
 function showConnection(target,showKey=false) {
   const m=loadManifest(target);
@@ -391,7 +462,7 @@ async function install(options) {
     if(!deployed&&exists(stage))fs.rmSync(stage,{recursive:true,force:true});
   }
 }
-const GUI_MESSAGES={INVALID_INPUT:'请检查 API 地址、API Key 和模型名称。',KEY_REQUIRED:'首次配置需要 API Key。',KEY_HOST_CHANGED:'更换服务地址来源后必须重新输入 API Key。',RUNTIME_CONFLICT:'已有安装不符合图形配置安全约定；未覆盖，请先处理原安装。',BUSY:'桥配置正在使用，请稍后重试。'};
+const GUI_MESSAGES={INVALID_INPUT:'请检查 API 地址、API Key 和模型名称。',KEY_REQUIRED:'首次配置需要 API Key。',KEY_HOST_CHANGED:'更换服务地址来源后必须重新输入 API Key。',RUNTIME_CONFLICT:'已有安装不符合图形配置安全约定；未覆盖，请先处理原安装。',BUSY:'桥配置正在使用，请稍后重试。',MODELS_AUTH:'API Key 未通过验证，可检查后重试或手填模型。',MODELS_FORBIDDEN:'服务拒绝读取模型清单，可手填模型。',MODELS_NOT_FOUND:'服务未提供兼容的模型清单，可手填模型。',MODELS_RATE_LIMIT:'读取模型清单过于频繁，请稍后重试或手填模型。',MODELS_TIMEOUT:'读取模型清单超时，可重试或手填模型。',MODELS_NETWORK:'无法安全连接模型清单服务，可重试或手填模型。',MODELS_INVALID_RESPONSE:'模型清单格式不兼容，可手填模型。',MODELS_TOO_LARGE:'模型清单响应过大，可手填模型。',MODELS_REDIRECT:'为保护 API Key，未跟随模型清单重定向；请检查 API 地址。',MODELS_FAILED:'读取模型清单失败，可重试或手填模型。'};
 function guiError(code){const error=new Error(GUI_MESSAGES[code]||GUI_MESSAGES.RUNTIME_CONFLICT);error.guiCode=code;return error;}
 function guiPaths(){
   const home=path.resolve(os.homedir()),target=path.join(home,'.local/share/ccr-bridge-kit'),settings=path.join(home,'.claude/settings.json');
@@ -415,15 +486,19 @@ function normalizeGuiEndpoint(input){
   else throw guiError('INVALID_INPUT');
   return url.href;
 }
-async function guiInput(){
-  let size=0;const chunks=[];
+async function guiInput(command){
+  let size=0;const chunks=[],models=command==='gui-models';
   try{
     for await(const chunk of process.stdin){size+=chunk.length;if(size>16384)throw guiError('INVALID_INPUT');chunks.push(chunk);}
     const input=JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if(!object(input)||Object.keys(input).some(k=>!['endpoint','apiKey','model'].includes(k))||typeof input.endpoint!=='string'||typeof input.model!=='string'||input.apiKey!==undefined&&typeof input.apiKey!=='string')throw guiError('INVALID_INPUT');
-    const apiKey=(input.apiKey||'').trim(),model=input.model.trim();
-    if(apiKey.length>1024||/[\u0000- \u007f]/.test(apiKey)||!model||input.model.length>200||/[,\u0000-\u001f\u007f]/.test(input.model))throw guiError('INVALID_INPUT');
-    return {endpoint:normalizeGuiEndpoint(input.endpoint),apiKey,model};
+    if(!object(input)||Object.keys(input).some(k=>!(models?['endpoint','apiKey']:['endpoint','apiKey','model']).includes(k))||typeof input.endpoint!=='string'||!models&&typeof input.model!=='string'||input.apiKey!==undefined&&typeof input.apiKey!=='string')throw guiError('INVALID_INPUT');
+    const apiKey=(input.apiKey||'').trim();
+    if((input.apiKey||'').length>1024||/[\u0000- \u007f]/.test(input.apiKey||''))throw guiError('INVALID_INPUT');
+    const endpoint=normalizeGuiEndpoint(input.endpoint);
+    if(models)return {endpoint,apiKey};
+    const model=input.model.trim();
+    if(!model||input.model.length>200||/[,\u0000-\u001f\u007f]/.test(input.model))throw guiError('INVALID_INPUT');
+    return {endpoint,apiKey,model};
   }catch(error){if(error.guiCode)throw error;throw guiError('INVALID_INPUT');}
 }
 function checkGuiRuntime(paths,previous=null,allowConfiguring=false){
@@ -556,16 +631,29 @@ async function guiConfigure(input){
     return {schema:1,id:'openai-bridge',configured:true,endpoint:configured.endpoint,model:configured.model,hasKey:true,localReady,connectionPath:configured.connectionPath,...(!localReady?{localError:'LOCAL_START_FAILED'}:{})};
   });
 }
+async function guiModels(input){
+  // 读取清单不保存配置、不探测/启动本地桥。只有未输入新 Key 时才读取已验证的 GUI 私有配置。
+  try{
+    return await require('./gui-models.cjs').listModels(input,{resolveSavedKey(endpoint){
+      const paths=guiPaths(),current=checkGuiRuntime(paths);
+      if(!current)throw guiError('KEY_REQUIRED');
+      if(new URL(endpoint).origin!==new URL(current.endpoint).origin)throw guiError('KEY_HOST_CHANGED');
+      checkGuiRuntime(paths,current);
+      return current.apiKey;
+    }});
+  }finally{input.apiKey='';}
+}
 async function gui(command,args){
   process.umask(0o077);
   scrubGuiEnv();
   try{
     if(args.length)throw guiError('INVALID_INPUT');
-    const result=command==='gui-configure'?await guiConfigure(await guiInput()):await guiStatus();
+    const result=command==='gui-models'?await guiModels(await guiInput(command)):command==='gui-configure'?await guiConfigure(await guiInput(command)):await guiStatus();
     console.log(JSON.stringify(result));
   }catch(error){
-    const code=error.guiCode||(error.message?.includes('正在使用')?'BUSY':'RUNTIME_CONFLICT');
-    console.error(JSON.stringify({schema:1,id:'openai-bridge',error:{code,message:GUI_MESSAGES[code]||GUI_MESSAGES.RUNTIME_CONFLICT}}));process.exitCode=1;
+    const requested=error.guiCode||(error.message?.includes('正在使用')?'BUSY':'RUNTIME_CONFLICT');
+    const code=Object.hasOwn(GUI_MESSAGES,requested)?requested:'RUNTIME_CONFLICT';
+    console.error(JSON.stringify({schema:1,id:'openai-bridge',error:{code,message:GUI_MESSAGES[code]}}));process.exitCode=1;
   }
 }
 function purgeTarget(target) {
@@ -581,45 +669,189 @@ async function confirmStop(target,options) {
   const message=options.purge?'将停止此安装并永久删除整个专用目录（含密钥、配置和日志）：'+target+'。输入 yes':'将停止此安装的看护和桥，可能打断请求。输入 yes';
   if((await ask(message))!=='yes')throw new Error('已取消。');
 }
-function stopManaged(target) {
-  // 共享同一身份校验和 service.lock；绝不按名称批量 pkill。
-  const script='source "$1/bridge-common.sh" || exit 1\n'+
-    'if watchdog_running; then W=$(< "$STATE/watchdog.pid"); kill -TERM "$W" || exit 1; for _ in {1..40}; do watchdog_running || break; sleep 0.2; done; watchdog_running && exit 1; fi\n'+
-    'exec 7> "$STATE/service.lock"; flock -w 10 7 || exit 1\n'+
-    'P=$(bridge_pid) || P=; if [[ -n "$P" ]]; then bridge_stop "$P" || exit 1; fi\n';
-  const r=run('bash',['-c',script,'bridge-kit-stop',target],{env:cleanEnv(),timeout:30000});
-  if(r.status!==0)throw new Error('未能安全停止此安装，文件与钩子均保留：'+r.stderr);
+function stopManaged(target,context=null) {
+  // 固定组件内联的停止协议。无论 manifest 如何自报 hash，绝不 source/exec 私有代码。
+  const baseline=stopMetadata(target),manifest=JSON.parse(instanceFile(path.join(target,MARKER),65536).data),port=instancePort(target);
+  if(manifest?.id!=='ccr-bridge-kit'||manifest.version!==VERSION||manifest.target!==target)throw new Error('停止目标不是规范的受管理实例。');
+  const registryFile=registration.fileOf(path.resolve(os.homedir()));
+  const registry=exists(registryFile)?instanceFile(registryFile,4096).data:null;
+  let startLock,serviceLock;
+  const recheck=()=>{
+    if(context)context.recheck();
+    if(startLock)startLock.check();if(serviceLock)serviceLock.check();
+    const current=stopMetadata(target);
+    if(current.stats.some((st,i)=>!sameFile(st,baseline.stats[i]))||!same(JSON.parse(instanceFile(path.join(target,MARKER),65536).data),manifest)||instancePort(target)!==port)throw new Error('停止期间实例身份已变更。');
+    const now=exists(registryFile)?instanceFile(registryFile,4096).data:null;
+    if(registry===null?now!==null:now===null||!registry.equals(now))throw new Error('停止期间服务注册已变更。');
+  };
+  const state=baseline.state;
+  const procFile=(pid,name,limit)=>{
+    const fd=fs.openSync('/proc/'+pid+'/'+name,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+    try{
+      const buffer=Buffer.alloc(limit+1);let size=0,n;
+      while(size<buffer.length&&(n=fs.readSync(fd,buffer,size,buffer.length-size,null))>0)size+=n;
+      if(size>limit)throw new Error('进程身份信息过大，拒绝停止。');
+      return buffer.subarray(0,size).toString('utf8');
+    }finally{fs.closeSync(fd);}
+  };
+  const executable=file=>{
+    const real=fs.realpathSync(file),stat=fs.statSync(real);
+    if(!stat.isFile())throw new Error('停止工具不是普通可执行文件。');
+    fs.accessSync(real,fs.constants.X_OK);
+    return {real,stat};
+  };
+  const nodeExecutable=executable(process.execPath);let bashExecutable;
+  const trustedBash=()=>{
+    if(bashExecutable)return bashExecutable;
+    for(const dir of (process.env.PATH||'').split(path.delimiter)){
+      const file=path.resolve(dir||'.','bash');
+      try{bashExecutable=executable(file);return bashExecutable;}
+      catch(error){if(!['ENOENT','ENOTDIR','EACCES'].includes(error.code))throw error;}
+    }
+    throw new Error('无法解析可信 Bash 停止工具。');
+  };
+  const processIdentity=(pid,kind)=>{
+    try{
+      const stat=procFile(pid,'stat',4096),end=stat.lastIndexOf(') '),fields=stat.slice(end+2).trim().split(/\s+/);
+      if(end<0||!/^\d+$/.test(fields[19]||''))throw new Error('进程身份信息不合法。');
+      if(fields[0]==='Z'||fields[0]==='X')return null;
+      const args=procFile(pid,'cmdline',65536).split('\0');if(args.at(-1)==='')args.pop();
+      let matches;
+      if(kind==='watchdog')matches=args.length===2&&path.basename(args[0])==='bash'&&args[1]===path.join(target,'watchdog.sh');
+      else{
+        const cli='node_modules/@musistudio/claude-code-router/dist/cli.js';
+        matches=args.length===3&&path.basename(args[0])==='node'&&args[2]==='start'&&(args[1]===path.join(target,cli)||args[1]===cli&&fs.readlinkSync('/proc/'+pid+'/cwd')===target);
+      }
+      if(!matches)return null;
+      // argv[0] 可任意伪装；真实 /proc/PID/exe 必须属于固定解析的解释器。
+      const expected=kind==='watchdog'?trustedBash():nodeExecutable,exe='/proc/'+pid+'/exe';
+      if(fs.realpathSync(exe)!==expected.real||!sameFile(fs.statSync(exe),expected.stat)||!sameFile(fs.statSync(expected.real),expected.stat))return null;
+      return {pid,stamp:fields[19]};
+    }catch(error){if(['ENOENT','ESRCH'].includes(error.code))return null;throw error;}
+  };
+  const stillSame=(identity,kind)=>{
+    const current=processIdentity(identity.pid,kind);
+    if(current&&current.stamp!==identity.stamp)throw new Error('停止期间 PID 已复用，拒绝发送信号。');
+    return !!current;
+  };
+  const signal=(identity,kind,name)=>{
+    recheck();
+    if(!stillSame(identity,kind))return;
+    recheck(); // /proc 身份读取之后也不能沿用先前注册，发送信号是独立副作用。
+    if(!stillSame(identity,kind))return;
+    try{process.kill(identity.pid,name);}catch(error){if(error.code!=='ESRCH')throw error;}
+  };
+  const wait=(identity,kind,rounds)=>{
+    for(let i=0;i<rounds;i++){
+      if(!stillSame(identity,kind))return true;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);
+    }
+    return !stillSame(identity,kind);
+  };
+  const removePid=(file,pid)=>{
+    recheck();if(!exists(file)||instancePid(file)!==pid)return;
+    const dir=openInstanceDirectory(path.dirname(file));
+    try{recheck();dir.check();if(instancePid(file)===pid){recheck();dir.check();fs.unlinkSync(dir.at(path.basename(file)));}}
+    finally{fs.closeSync(dir.fd);}
+  };
+  const acquire=(lock,seconds)=>{
+    recheck();lock.check();
+    const result=run('flock',['-w',String(seconds),'3'],{stdio:['ignore','ignore','pipe',lock.fd],timeout:(seconds+1)*1000});
+    lock.check();recheck();
+    if(result.status!==0)throw new Error('等待实例停止锁超时，运行文件与钩子保留。');
+  };
+  const probeWatchdog=()=>{
+    const file=path.join(state,'watchdog.lock');if(!exists(file))throw new Error('看护 PID 缺少对应锁，拒绝停止。');
+    const lock=openInstanceLock(file,false,recheck);
+    try{
+      recheck();lock.check();
+      const result=run('flock',['-n','3'],{stdio:['ignore','ignore','pipe',lock.fd],timeout:2000});
+      lock.check();recheck();
+      if(result.status!==0&&result.status!==1)throw new Error('无法核对看护锁。');
+      return result.status===1;
+    }finally{lock.close();}
+  };
+  try{
+    recheck();
+    // 与既有 start 一致的锁顺序；服务锁先安全打开，任何坏锁都不能先触发 kill。
+    startLock=openInstanceLock(path.join(state,'start.lock'),true,recheck);
+    acquire(startLock,10);
+    serviceLock=openInstanceLock(path.join(state,'service.lock'),true,recheck);
+    const watchdogPidFile=path.join(state,'watchdog.pid'),watchdogPid=instancePid(watchdogPidFile);
+    if(watchdogPid){
+      const identity=processIdentity(watchdogPid,'watchdog');
+      if(identity){
+        if(!probeWatchdog())throw new Error('看护身份与锁不一致，拒绝停止。');
+        recheck();signal(identity,'watchdog','SIGTERM');
+        if(!wait(identity,'watchdog',80))throw new Error('未能在限定时间内安全停止看护。');
+        recheck();removePid(watchdogPidFile,watchdogPid);
+      }
+    }
+    acquire(serviceLock,10);
+    const pidFile=path.join(state,'.claude-code-router.pid'),pid=instancePid(pidFile);
+    if(pid){
+      const identity=processIdentity(pid,'bridge');
+      if(identity){
+        recheck();signal(identity,'bridge','SIGTERM');
+        if(!wait(identity,'bridge',40)){
+          recheck();signal(identity,'bridge','SIGKILL');
+          if(!wait(identity,'bridge',10))throw new Error('未能在限定时间内安全停止桥。');
+        }
+        recheck();removePid(pidFile,pid);
+      }
+    }
+    recheck();
+  }finally{if(serviceLock)serviceLock.close();if(startLock)startLock.close();}
+}
+function instanceSettings(file) {
+  instanceDirectory(path.dirname(file));
+  const read=exists(file)?instanceFile(file):null,value=read?JSON.parse(read.data):{};
+  if(!object(value)||value.hooks!==undefined&&!object(value.hooks)||value.hooks?.SessionStart!==undefined&&!Array.isArray(value.hooks.SessionStart))throw new Error('Claude 设置结构不合法，未修改。');
+  return {value,read};
+}
+function instanceAtomic(file,content,recheck) {
+  const dir=openInstanceDirectory(path.dirname(file)),temp=dir.at('.kit-'+crypto.randomUUID()+'.tmp');
+  let created=false;
+  try{
+    recheck();dir.check();
+    fs.writeFileSync(temp,content,{flag:'wx',mode:0o600});created=true;
+    recheck();dir.check();
+    fs.renameSync(temp,dir.at(path.basename(file)));created=false;
+  }finally{if(created)fs.unlinkSync(temp);fs.closeSync(dir.fd);}
 }
 function uninstallInstance(target,options,instance) {
   return withInstanceLock(instance,checkLock=>{
     let registered=true;
     const recheck=()=>{checkLock();return checkInstance(target,options,instance,registered);};
     // 交互确认和锁等待后重新核对，后续每个副作用也不能沿用初次读到的注册。
-    recheck();
-    const settings=instance.manifest.settings;
-    readSettings(settings,true);
-    recheck();
-    atomic(path.join(target,'disabled'),'uninstalled\n');
-    recheck();
-    stopManaged(target);
-    const before=readSettings(settings,true),after=removeHook(before,target);
-    recheck();
+    recheck();const settings=instance.manifest.settings,before=instanceSettings(settings);
+    const settingsUnchanged=()=>{
+      recheck();const now=instanceSettings(settings);
+      if(before.read?(!now.read||!sameFile(before.read.stat,now.read.stat)||!before.read.data.equals(now.read.data)):now.read)throw new Error('卸载期间 Claude 设置已变更，未覆盖。');
+    };
+    instanceAtomic(path.join(target,'disabled'),'uninstalled\n',settingsUnchanged);
+    recheck();stopManaged(target,{recheck});
+    settingsUnchanged();const after=removeHook(before.value,target);
     // 已持有注册锁且完整核对 endpoint/port；不可重入旧 unregister 或忽略其 false。
-    fs.unlinkSync(registration.fileOf(instance.home));
-    registered=false;
-    if(!same(before,after)){
-      recheck();
-      if(exists(settings))backup(settings);
-      recheck();
-      if(!same(readSettings(settings,true),before))throw new Error('卸载期间 Claude 设置已变更，未覆盖。');
-      atomic(settings,JSON.stringify(after,null,2)+'\n');
+    const dir=openInstanceDirectory(path.dirname(registration.fileOf(instance.home)));
+    try{settingsUnchanged();dir.check();fs.unlinkSync(dir.at(path.basename(registration.fileOf(instance.home))));registered=false;}
+    finally{fs.closeSync(dir.fd);}
+    if(!same(before.value,after)){
+      if(before.read){
+        const backupFile=settings+'.bridge-kit-backup-'+Date.now()+'-'+crypto.randomBytes(3).toString('hex');
+        const settingsDir=openInstanceDirectory(path.dirname(settings));
+        try{settingsUnchanged();settingsDir.check();fs.writeFileSync(settingsDir.at(path.basename(backupFile)),before.read.data,{flag:'wx',mode:0o600});}
+        finally{fs.closeSync(settingsDir.fd);}
+      }
+      instanceAtomic(settings,JSON.stringify(after,null,2)+'\n',settingsUnchanged);
     }
     recheck();
     console.log('已停止并移除本安装的钩子，其他配置未动。');
     if(options.purge){
       purgeTarget(target);
-      recheck();
-      fs.rmSync(target,{recursive:true});
+      const parent=openInstanceDirectory(path.dirname(target));
+      try{recheck();parent.check();fs.rmSync(parent.at(path.basename(target)),{recursive:true});}
+      finally{fs.closeSync(parent.fd);}
       console.log('已删除整个专用安装目录（含依赖、密钥、配置和日志）：'+target);
     }else console.log('安装目录和密钥保留：'+target+'；如需永久删除，确认备份后使用 uninstall --yes --purge。');
   });
@@ -704,7 +936,7 @@ function parse(argv) {
 async function main() {
   process.umask(0o077);
   const [cmd='install',...argv]=process.argv.slice(2);
-  if(['gui-status','gui-configure'].includes(cmd)){await gui(cmd,argv);return;}
+  if(['gui-status','gui-configure','gui-models'].includes(cmd)){await gui(cmd,argv);return;}
   const options=parse(argv);
   if(options.help){console.log('用法：bash install.sh [--config 私有JSON] [--port 端口] [--dir 安装目录] [--settings 设置路径] [--yes] [--start]\n管理：node manage.cjs status|start|stop|uninstall|connection --dir 安装目录 [--yes] [--show-key] [--purge（仅卸载，永久删除专用目录）]');return;}
   if(!COMMANDS.has(cmd))throw new Error('未知操作：'+cmd);

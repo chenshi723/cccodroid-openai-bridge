@@ -118,15 +118,18 @@ test('GUI edit empty key retains same-origin secret/local key/registration and r
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.target,'connection.json'))).apiKey,JSON.parse(c).apiKey);
   assert.deepEqual(fs.readFileSync(f.registry),reg);assert.deepEqual(fs.readFileSync(path.join(f.target,'.ccr-bridge-kit.json')),m);
   assert.equal(fs.existsSync(path.join(f.target,'disabled')),false);
-  assert.equal(fs.readFileSync(path.join(f.target,'stop-called'),'utf8'),'watchdog-checked\n');
+  assert.equal(fs.existsSync(path.join(f.target,'stop-called')),false,'fixed stop must not source the private common');
+  assert.equal(fs.existsSync(path.join(f.target,'runtime-home/.claude-code-router/service.lock')),true);
   assert.deepEqual(snapshot(foreign),foreignBefore);
 }));
 
 test('GUI edit no-op saves do not stop, while replacing secret keeps local bridge key',()=>fixture(f=>{
   saved(f);const c=JSON.parse(fs.readFileSync(path.join(f.target,'connection.json')));
   saved(f,{...input,apiKey:''});assert.equal(fs.existsSync(path.join(f.target,'stop-called')),false);
+  assert.equal(fs.existsSync(path.join(f.target,'runtime-home/.claude-code-router/service.lock')),false);
   saved(f,{...input,apiKey:'fixture-replacement-key'});assert.equal(config(f).Providers[0].api_key,'fixture-replacement-key');
-  assert.equal(config(f).APIKEY,c.apiKey);assert.equal(fs.existsSync(path.join(f.target,'stop-called')),true);
+  assert.equal(config(f).APIKEY,c.apiKey);assert.equal(fs.existsSync(path.join(f.target,'stop-called')),false);
+  assert.equal(fs.existsSync(path.join(f.target,'runtime-home/.claude-code-router/service.lock')),true);
 }));
 
 test('GUI edit requires fresh key for changed hostname, scheme or port before stopping',()=>fixture(f=>{
@@ -163,13 +166,56 @@ test('GUI ready status uses only validated literal loopback health and does not 
   const before=snapshot(f.home),status=result(f.run('gui-status',undefined,{env:{NODE_OPTIONS:'--require='+hook}}));assert.equal(status.localReady,true);assert.deepEqual(snapshot(f.home),before);assert(!r.stdout.includes(upstreamKey));
 }));
 
+function models(f,body,options={}){
+  // Test-only module stub: exercise the actual stdin/dispatch/old-key resolver without network.
+  const hook=path.join(f.root,'models-stub.cjs');
+  fs.writeFileSync(hook,`const Module=require('node:module'),load=Module._load;
+Module._load=function(name,parent){if(name==='./gui-models.cjs'&&parent.filename===${JSON.stringify(path.join(f.kit,'installer.cjs'))})return {async listModels(input,{resolveSavedKey}){
+  const key=input.apiKey||await resolveSavedKey(input.endpoint);
+  if(key!==${JSON.stringify(upstreamKey)})throw Object.assign(new Error('must not echo '+key),{guiCode:'MODELS_AUTH'});
+  return {schema:1,id:'openai-bridge',models:[{id:'fixture-listed-model'}],truncated:false};
+}};return load.apply(this,arguments);};`);
+  return f.run('gui-models',body,{...options,env:{NODE_OPTIONS:'--require='+hook,...options.env}});
+}
+
+test('GUI models accepts endpoint/key only and never installs, probes health or writes state',()=>fixture(f=>{
+  const before=snapshot(f.home),r=models(f,{endpoint:input.endpoint,apiKey:upstreamKey});
+  assert.deepEqual(result(r),{schema:1,id:'openai-bridge',models:[{id:'fixture-listed-model'}],truncated:false});
+  assert.deepEqual(snapshot(f.home),before);assert(!r.stdout.includes(upstreamKey));
+  for(const body of [null,[],{...input},{endpoint:input.endpoint,apiKey:upstreamKey,consent:true},{endpoint:'http://unsafe.invalid/v1',apiKey:upstreamKey},{endpoint:input.endpoint,apiKey:'bad\nkey'},'x'.repeat(17000)]){
+    const bad=models(f,body);assert.equal(bad.status,1,bad.stdout+bad.stderr);
+    assert.equal(JSON.parse(bad.stderr).error.code,'INVALID_INPUT');assert.deepEqual(snapshot(f.home),before);
+  }
+  const argv=models(f,{endpoint:input.endpoint,apiKey:upstreamKey},{args:['--key',upstreamKey]});
+  assert.equal(argv.status,1);assert.equal(JSON.parse(argv.stderr).error.code,'INVALID_INPUT');assert(!argv.stderr.includes(upstreamKey));
+}));
+
+test('GUI models blank key only reuses a healthy same-origin GUI secret without health or writes',()=>fixture(f=>{
+  saved(f);const before=snapshot(f.home),r=models(f,{endpoint:'https://api.example.invalid/another/chat/completions'});
+  assert.equal(result(r).models[0].id,'fixture-listed-model');assert.deepEqual(snapshot(f.home),before);
+  assert(!r.stdout.includes(upstreamKey));assert.equal(fs.existsSync(path.join(f.target,'stop-called')),false);
+  for(const endpoint of ['https://other.example.invalid/v1','https://api.example.invalid:8443/v1']){
+    const denied=models(f,{endpoint});assert.equal(denied.status,1);
+    assert.equal(JSON.parse(denied.stderr).error.code,'KEY_HOST_CHANGED');assert.deepEqual(snapshot(f.home),before);
+  }
+}));
+
+test('GUI models blank key rejects missing/manual/tampered runtime without any state changes',()=>{
+  fixture(f=>{const before=snapshot(f.home),r=models(f,{endpoint:input.endpoint});assert.equal(r.status,1);assert.equal(JSON.parse(r.stderr).error.code,'KEY_REQUIRED');assert.deepEqual(snapshot(f.home),before);});
+  for(const mutate of [
+    f=>{const file=path.join(f.target,'.ccr-bridge-kit.json'),m=JSON.parse(fs.readFileSync(file));delete m.guiManaged;write(file,m);},
+    f=>fs.appendFileSync(path.join(f.target,'bridge-common.sh'),'# user edit\n'),
+    f=>{const reg=JSON.parse(fs.readFileSync(f.registry));reg.instanceId='f'.repeat(32);write(f.registry,reg);}
+  ])fixture(f=>{saved(f);mutate(f);const before=snapshot(f.home),r=models(f,{endpoint:input.endpoint});assert.equal(r.status,1);assert.equal(JSON.parse(r.stderr).error.code,'RUNTIME_CONFLICT');assert.deepEqual(snapshot(f.home),before);assert(!r.stderr.includes(upstreamKey));});
+});
+
 function race(f,phase,change,body={...input,model:'fixture-model-changed'}){
   const hook=path.join(f.root,'gui-race.cjs');
   fs.writeFileSync(hook,`'use strict';const fs=require('node:fs'),cp=require('node:child_process');
 const target=${JSON.stringify(f.target)},registry=${JSON.stringify(f.registry)},home=${JSON.stringify(f.home)},marker=target+'/.ccr-bridge-kit.json',configFile=target+'/runtime-home/.claude-code-router/config.json',connectionFile=target+'/connection.json';
 const original=cp.spawnSync;let changed=false;const save=(p,v)=>fs.writeFileSync(p,JSON.stringify(v)+'\\n');
 cp.spawnSync=function(bin,args,options){const r=original.apply(this,arguments);
-if(!changed&&(${phase==='lock'?"bin==='flock'&&args[0]==='-w'":phase==='stop'?"bin==='bash'&&args[2]==='bridge-kit-stop'":"bin===process.execPath&&args[0].endsWith('/patch-ccr.js')"})){changed=true;${change}}
+if(!changed&&(${phase==='lock'?"bin==='flock'&&args[0]==='-w'&&args[1]==='5'":phase==='stop'?"bin==='flock'&&args[0]==='-w'&&args[1]==='10'&&fs.existsSync(target+'/runtime-home/.claude-code-router/service.lock')":"bin===process.execPath&&args[0].endsWith('/patch-ccr.js')"})){changed=true;${change}}
 return r;};`);
   return f.run('gui-configure',body,{env:{NODE_OPTIONS:'--require='+hook}});
 }

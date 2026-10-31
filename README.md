@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-> **1.0.5-r8 配套生命周期修复。** 当前 App 的 HMAC 通道不能由旧 Hook 解码识别。本实现改为配置时显式注册不含密钥的本地端点，配套 App 在包装 URL 和启动 CLI 前调用固定组件入口并等待就绪，桥提供有限恢复和身份验证卸载。是否已经发布以 App / 组件各自正式发行记录为准；先发布兼容 App，再发布组件并由用户确认配置或迁移。用户另行授权的本地手工桥适配已报告“退出并重开 App 后仍可使用”；它不是本版本的正式签名安装，也没有验证真正 APK 升级。源码合入不能代替最终签名配套包的八项验收，单独更新组件不能修复旧 App。详见 [交付门槛](docs/DELIVERY-ACCEPTANCE.zh-CN.md)。
+> **1.0.5-r9 配套生命周期与模型清单。** 当前 App 的 HMAC 通道不能由旧 Hook 解码识别。本实现改为配置时显式注册不含密钥的本地端点，配套 App 在包装 URL 和启动 CLI 前调用固定组件入口并等待就绪，桥提供有限恢复和身份验证卸载。是否已经发布以 App / 组件各自正式发行记录为准；先发布兼容 App，再发布组件并由用户确认配置或迁移。用户另行授权的本地手工桥适配已报告“退出并重开 App 后仍可使用”；它不是本版本的正式签名安装，也没有验证真正 APK 升级。源码合入不能代替最终签名配套包的八项验收，单独更新组件不能修复旧 App。详见 [交付门槛](docs/DELIVERY-ACCEPTANCE.zh-CN.md)。
 
 - 基于 MIT 许可的 `@musistudio/claude-code-router` **1.0.73**，固定依赖和完整性锁文件。
 - 含思考强度映射、上游取消、JSON/SSE 嗅探、工具图片处理、用量保留、原子补丁、单例启动及看护。
@@ -37,7 +37,7 @@
 配套 App 提供图形配置：
 
 1. 在扩展页安装组件后，点击原桥卡片“卸载”左侧的“配置”。只填 **API 地址、API Key、模型名称**，用户私下输入真实密钥，不提供给 AI。
-2. 根地址或 `/v1` 会明确补全到 `/v1/chat/completions`；其他私有路径须填写完整的 `/chat/completions`，不猜厂商、不自动拉远端模型清单，不支持 Responses API。
+2. 根地址或 `/v1` 会明确补全到 `/v1/chat/completions`；其他私有路径须填写完整的 `/chat/completions`，不猜厂商，不支持 Responses API。首次勾选允许读取模型清单后，地址和 Key 填好会自动防抖读取同源 `/models`；可搜索选择，也可手填。仅发送认证读取清单，不发送对话、不调用模型；失败或服务不支持清单时不阻止手填保存。
 3. 保存前确认后续数据发送目的地；保存只进行本机配置和健康就绪检查，**不调用远端模型、不消耗模型推理额度，也不切换当前会话**。本地就绪与远端推理状态分开显示。
 4. App 自动添加本桥专用接口，不要求手工生成、查找或复制第二把本地密钥。只有点击成功页“新建会话使用”，才为新会话选择此接口；不会改变其他会话或全局默认。
 5. 修改时不回显旧 Key，留空保留；更换服务地址来源必须重输。图形配置只管理完整兼容的组件专用实例，不能自动覆盖旧手工桥或不兼容私有运行副本。
@@ -77,6 +77,9 @@ openai-bridge uninstall --yes
 npm ci --ignore-scripts --omit=dev --no-audit --no-fund
 node tests/test-registration.cjs
 node tests/test-installer.cjs
+node tests/test-uninstall-instance.cjs
+node tests/test-gui-config.cjs
+node tests/test-gui-models.cjs
 node tests/test-hooks.cjs
 node tests/test-install-e2e.cjs
 node tests/test-install-e2e.cjs --bundled
@@ -94,7 +97,7 @@ node tests/audit-bundle.cjs
 
 ## 向组件市场同步
 
-先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（1.0.5-r8 含本轮审查修正；已发布版本以市场正式索引为准）。配方文案的最终版本以市场仓库 `greyoak111/cccodroid-components` 为准，本仓库 `recipe/` 与其保持一致，避免下次同步覆盖。
+先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（1.0.5-r9 含本轮审查修正及可选自动模型清单；已发布版本以市场正式索引为准）。配方文案的最终版本以市场仓库 `greyoak111/cccodroid-components` 为准，本仓库 `recipe/` 与其保持一致，避免下次同步覆盖。
 
 ## 许可与贡献
 

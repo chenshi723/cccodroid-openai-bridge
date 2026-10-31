@@ -15,8 +15,8 @@ try{
   if(command==='--selftest'){
     if(args.length)throw new Error('selftest 不接受额外参数。');
     run(path.join(__dirname,'runtime/selftest.cjs'),[]);
-  }else if(command==='gui-status'||command==='gui-configure'){
-    // 三字段表单只通过继承的 stdin 管道传秘密；不接受 argv 参数，不经旧私有管理器。
+  }else if(command==='gui-status'||command==='gui-configure'||command==='gui-models'){
+    // 图形配置和模型清单只通过继承的 stdin 管道传秘密；不接受 argv 参数，不经旧私有管理器。
     run(path.join(__dirname,'installer.cjs'),[command,...args]);
   }else if(command==='help'||command==='--help'){
     console.log('openai-bridge --selftest | configure | start | status | stop --yes | uninstall --yes [--purge]\nApp 实例操作：ensure | uninstall --dir 目录 --endpoint 本机地址 --instance 实例ID [--yes]\n--endpoint/--instance 必须成对；--purge 会永久删除整个专用目录，含密钥和日志，须另行确认。\nconfigure 请用户自己在终端输入端点和密钥；安全修复范围与未完成的发布验证见源仓库 SECURITY.md。');
