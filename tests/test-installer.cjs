@@ -114,6 +114,20 @@ test('parser accepts supported flags and rejects unknown or missing values',()=>
   assert.deepEqual(api.parse(['--yes','--purge']),{yes:true,purge:true});
   assert.throws(()=>api.parse(['--api-key','secret']));
   assert.throws(()=>api.parse(['--dir']));
+  for(const name of ['dir','endpoint','instance'])assert.throws(()=>api.parse(['--'+name,'one','--'+name,'two']),/重复/);
+});
+test('instance options require a complete pair for ensure or uninstall only',()=>{
+  const options={endpoint:'http://127.0.0.1:3459',instance:'1'.repeat(32)};
+  assert.equal(api.instanceOptions('ensure',options),true);
+  assert.equal(api.instanceOptions('uninstall',options),true);
+  assert.equal(api.instanceOptions('uninstall',{}),false);
+  assert.throws(()=>api.instanceOptions('ensure',{}),/必须提供/);
+  for(const command of ['ensure','uninstall']){
+    assert.throws(()=>api.instanceOptions(command,{endpoint:options.endpoint}),/同时提供/);
+    assert.throws(()=>api.instanceOptions(command,{instance:options.instance}),/同时提供/);
+    assert.throws(()=>api.instanceOptions(command,{...options,instance:'wrong'}),/不合法/);
+  }
+  for(const command of ['install','configure','start','status','stop','connection'])assert.throws(()=>api.instanceOptions(command,options),/只适用于/);
 });
 test('purge refuses unowned directories, HOME and symbolic-link targets without deleting data',()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kit-purge-'));

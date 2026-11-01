@@ -9,6 +9,7 @@ const net=require('node:net');
 const {spawn}=require('node:child_process');
 const root=path.resolve(__dirname,'..');
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const wrapped=(url,key='0'.repeat(32))=>'http://127.0.0.1:45000/u/'+(key?key+'/':'')+Buffer.from(url).toString('base64url');
 let passed=0;
 function run(bin,args,env,limit=5000){
   return new Promise((resolve,reject)=>{
@@ -100,6 +101,57 @@ async function test(name,body){
     await until(f.healthy,'concurrent Hook ready');await sleep(300);
     assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim(),'start');
   });
+  await test('wrapped foreign endpoints and malformed wrappers skip without Node or state',async f=>{
+    const bash=process.env.PREFIX?path.join(process.env.PREFIX,'bin/bash'):'/bin/bash';
+    const minimal=path.join(f.dir,'minimal');fs.mkdirSync(minimal);
+    for(const name of ['dirname','base64']){
+      const result=await run(bash,['-c','command -v '+name],f.env);
+      fs.symlinkSync(result.stdout.trim(),path.join(minimal,name));
+    }
+    const base=f.env.ANTHROPIC_BASE_URL;
+    const invalid=[
+      ...['https://api.anthropic.com',base+'0',base+'@elsewhere.invalid',base+'.evil.invalid',base+'\n',base+'\0',wrapped(base)].map(url=>wrapped(url)),
+      wrapped(base).replace('http://127.0.0.1:45000','http://elsewhere.invalid:45000'),
+      wrapped(base).replace(':45000/',':0/'),wrapped(base).replace(':45000/',':65536/'),
+      wrapped(base).replace('/u/'+ '0'.repeat(32)+'/','/u/not-a-valid-key/'),
+      wrapped(base)+'=',wrapped(base)+'/v1',wrapped(base)+'?query',
+      'http://127.0.0.1:45000/u/'+'0'.repeat(32)+'/a',
+      wrapped(base)+'A'.repeat(8192)
+    ];
+    for(const url of invalid){
+      const r=await run(bash,[path.join(f.dir,'start-bridge.sh'),'--hook'],{...f.env,PATH:minimal,ANTHROPIC_BASE_URL:url},2000);
+      assert.equal(r.status,0,r.stderr);assert.equal(r.stdout+r.stderr,'');
+      assert.equal(fs.existsSync(path.join(f.state,'start.log')),false);
+      assert.equal(fs.existsSync(path.join(f.dir,'patch-runs')),false);
+    }
+  });
+  await test('App streamfix wrapping starts the matching cold bridge asynchronously',async f=>{
+    const r=await f.hook({ANTHROPIC_BASE_URL:wrapped(f.env.ANTHROPIC_BASE_URL),HOOK_TEST_PATCH_DELAY:'1800'});
+    assert.equal(r.status,0,r.stderr);assert.ok(r.ms<1500,'wrapped Hook blocked '+r.ms+' ms');
+    assert.equal(await f.healthy(),false);
+    await until(f.healthy,'App-wrapped background CCR ready');
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim(),'start');
+  });
+  for(const [name,url] of [
+    ['keyed wrapper with inner trailing slash',base=>wrapped(base+'/')],
+    ['keyed wrapper with /v1 and outer trailing slash',base=>wrapped(base+'/v1')+'/'],
+    ['legacy unkeyed wrapper',base=>wrapped(base,null)]
+  ]){
+    await test(name+' starts its own cold bridge',async f=>{
+      assert.equal(await f.healthy(),false);
+      const r=await f.hook({ANTHROPIC_BASE_URL:url(f.env.ANTHROPIC_BASE_URL)});
+      assert.equal(r.status,0,r.stderr);
+      await until(f.healthy,name+' cold dispatch');
+      assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim(),'start');
+    });
+  }
+  await test('wrapped paths and legacy unkeyed wrappers retain single-instance dispatch',async f=>{
+    const urls=[wrapped(f.env.ANTHROPIC_BASE_URL+'/'),wrapped(f.env.ANTHROPIC_BASE_URL+'/v1')+'/',wrapped(f.env.ANTHROPIC_BASE_URL,null)];
+    const results=await Promise.all(urls.map(url=>f.hook({ANTHROPIC_BASE_URL:url})));
+    for(const r of results)assert.equal(r.status,0,r.stderr);
+    await until(f.healthy,'wrapped concurrent Hook ready');await sleep(300);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim(),'start');
+  });
   await test('a held service lock does not block the matching Hook',async f=>{
     const holder=spawn('flock',[path.join(f.state,'service.lock'),'sleep','2'],{env:f.env,stdio:'ignore'});
     try{await sleep(150);const r=await f.hook();assert.equal(r.status,0,r.stderr);assert.ok(r.ms<1500,'hook waited for service lock');assert.equal(await f.healthy(),false);}finally{holder.kill('SIGTERM');}
@@ -134,6 +186,53 @@ async function test(name,body){
     process.kill(pid,'SIGTERM');await until(async()=>!await f.healthy(),'fake CCR stopped');
     assert.equal((await f.hook()).status,0);await sleep(400);
     assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim(),'start');
+  });
+  await test('one unexpected exit recovers without starting duplicate watchdogs',async f=>{
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'initial ready');
+    const watch=f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh'));
+    process.kill(f.alive('.claude-code-router.pid',f.cli),'SIGTERM');
+    await until(()=>fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim().split('\n').length===2,'bounded recovery');
+    await until(f.healthy,'recovered CCR ready');
+    assert.equal(f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),watch);
+    assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+  });
+  await test('persistent crashes exhaust a durable budget and Hook cannot rearm',async f=>{
+    fs.writeFileSync(f.cli,"const fs=require('node:fs'),path=require('node:path');fs.appendFileSync(path.join(process.env.HOME,'.claude-code-router','fake-starts'),'start\\n');process.exitCode=1;\n");
+    assert.equal((await f.hook()).status,0);
+    await until(()=>fs.existsSync(path.join(f.state,'recovery.failed')),'durable recovery failure');
+    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'watchdog stopped at limit');
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim().split('\n').length,3);
+    assert.equal((await f.hook()).status,0);await sleep(500);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim().split('\n').length,3);
+    const manual=await run('bash',[path.join(f.dir,'start-bridge.sh')],f.env);
+    assert.notEqual(manual.status,0);assert.match(manual.stderr,/恢复达到上限/);
+    fs.rmSync(path.join(f.state,'recovery.failed'));
+    const restarted=await run('bash',[path.join(f.dir,'watchdog.sh')],f.env);
+    assert.notEqual(restarted.status,0);assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),true);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim().split('\n').length,3);
+  });
+  await test('sustained healthy service replenishes the recovery budget',async f=>{
+    assert.equal((await f.hook({CCR_BRIDGE_RECOVERY_STABLE:'1'})).status,0);await until(f.healthy,'stable initial ready');
+    await until(()=>!fs.existsSync(path.join(f.state,'recovery.attempts')),'healthy stable budget reset');
+    process.kill(f.alive('.claude-code-router.pid',f.cli),'SIGTERM');
+    await until(()=>fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim().split('\n').length===2,'recovery after stable reset');
+    await until(f.healthy,'stable service recovered');
+    assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+  });
+  await test('persistent patch errors also exhaust the durable budget',async f=>{
+    fs.writeFileSync(path.join(f.dir,'patch-ccr.js'),"const fs=require('node:fs');fs.appendFileSync(__dirname+'/patch-runs','patch\\n');process.exitCode=1;\n");
+    assert.equal((await f.hook()).status,0);
+    await until(()=>fs.existsSync(path.join(f.state,'recovery.failed')),'patch failure budget');
+    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'watchdog stopped after patch failures');
+    assert.equal(fs.readFileSync(path.join(f.dir,'patch-runs'),'utf8').trim().split('\n').length,3);
+    assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);
+  });
+  await test('uninstalled tombstone blocks retained Hook and direct watchdog',async f=>{
+    fs.writeFileSync(path.join(f.dir,'disabled'),'uninstalled\n');
+    assert.equal((await f.hook()).status,0);
+    const watch=await run('bash',[path.join(f.dir,'watchdog.sh')],f.env);assert.equal(watch.status,0);
+    assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);
+    assert.equal(await f.healthy(),false);
   });
   console.log('PASS: '+passed+' isolated Hook lifecycle tests');
 })().catch(error=>{console.error(error);process.exitCode=1;});

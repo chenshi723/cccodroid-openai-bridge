@@ -279,6 +279,28 @@ async function main() {
     }
   });
 
+  await test("Removed minimatch internals with retained bundle references fail without writing", () => {
+    for (const factory of ["require_ast", "require_brace_expressions"]) {
+      const source = original + "\nvar unknownReference = " + factory + "();\n";
+      const copy = fixture("retained-" + factory, source);
+      assert.match(apply(copy, 1).stderr, new RegExp("retained reference " + factory));
+      assert.equal(fs.readFileSync(copy.cli, "utf8"), source);
+      assert.equal(fs.existsSync(copy.cli + ".orig"), false);
+      noTemps(copy);
+    }
+  });
+  await test("Outdated external glob/minimatch dependencies fail closed", () => {
+    for (const [name, version] of [["glob", "11.1.0"], ["minimatch", "10.2.6"]]) {
+      const copy = fixture("outdated-" + name, original);
+      const dir = path.join(copy.dir, "node_modules", name);
+      fs.unlinkSync(dir);fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({name, version}));
+      assert.match(apply(copy, 1).stderr, new RegExp(name + " .* dependency"));
+      assert.equal(fs.readFileSync(copy.cli, "utf8"), original);
+      assert.equal(fs.existsSync(copy.cli + ".orig"), false);
+      noTemps(copy);
+    }
+  });
   const transformer = extract(patched);
   await test("Request stream:false and effort patches still execute normally", async () => {
     const request = await transformer.transformRequestOut({ model: "test-model", messages: [], output_config: { effort: "max" }, thinking: { type: "adaptive" } });

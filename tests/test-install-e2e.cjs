@@ -11,6 +11,7 @@ const assert=require('node:assert/strict');
 const sourceKit=process.env.OPENAI_BRIDGE_TEST_SOURCE?path.resolve(process.env.OPENAI_BRIDGE_TEST_SOURCE):path.resolve(__dirname,'..');
 let kit=sourceKit;
 const bundled=process.argv.includes('--bundled');
+let testEnv;
 function exec(args,opts={}){
   if(bundled){
     const [action,...rest]=args;
@@ -20,11 +21,17 @@ function exec(args,opts={}){
 }
 function command(bin,args,opts={}){
   return new Promise((resolve,reject)=>{
-    const p=spawn(bin,args,{env:process.env,...opts});
-    let stdout='',stderr='';
+    const p=spawn(bin,args,{...opts,detached:true,env:{...testEnv,...opts.env}});
+    let stdout='',stderr='',timedOut=false;
     p.stdout.on('data',b=>stdout+=b);p.stderr.on('data',b=>stderr+=b);
-    const timer=setTimeout(()=>{p.kill('SIGKILL');reject(Error('installer timed out'));},360000);
-    p.on('error',reject);p.on('close',status=>{clearTimeout(timer);resolve({status,stdout,stderr});});
+    const timer=setTimeout(()=>{timedOut=true;try{process.kill(-p.pid,'SIGKILL');}catch{p.kill('SIGKILL');}},360000);
+    p.once('error',e=>{clearTimeout(timer);reject(e);});
+    p.once('close',(status,signal)=>{
+      clearTimeout(timer);
+      if(timedOut)return reject(Error('installer timed out: '+JSON.stringify({status,signal})+'\n'+stderr));
+      if(signal)return reject(Error('installer terminated by '+signal+'\n'+stderr));
+      resolve({status,signal,timedOut,stdout,stderr});
+    });
   });
 }
 const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',()=>resolve(server.address().port));});
@@ -32,6 +39,10 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
   const sourceCli=path.join(sourceKit,'node_modules/@musistudio/claude-code-router/dist/cli.js');
   const sourceBytes=fs.readFileSync(sourceCli),sourceStat=fs.statSync(sourceCli);
   const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'kit-e2e-'));
+  const home=path.join(tmp,'client-home');fs.mkdirSync(home);
+  const allowed=new Set(['PATH','PREFIX','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR']);
+  testEnv=Object.fromEntries(Object.entries(process.env).filter(([k])=>allowed.has(k)));
+  Object.assign(testEnv,{HOME:home,NPM_CONFIG_USERCONFIG:path.join(home,'no-npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(home,'no-global-npmrc'),NPM_CONFIG_CACHE:path.join(home,'.npm'),CCR_BRIDGE_START_TIMEOUT:'30'});
   kit=path.join(tmp,'component-source');fs.mkdirSync(kit);
   for(const file of ['installer.cjs','component.cjs','package.json','package-lock.json','LICENSE','LICENSE-CCR.txt','README.md']){
     const from=path.join(sourceKit,file);if(fs.existsSync(from))fs.copyFileSync(from,path.join(kit,file));
@@ -52,13 +63,12 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
       res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(result));
     });
   });
-  let installed=false;
   try{
     const upPort=await listen(upstream);
     const probe=net.createServer(),port=await listen(probe);await new Promise(r=>probe.close(r));
     fs.writeFileSync(cfg,JSON.stringify({endpoint:`http://127.0.0.1:${upPort}/v1/chat/completions`,apiKey:'test-upstream-only',model:'test-model',port}),{mode:0o600});
     let r=await exec(['install','--dir',target,'--settings',settings,'--config',cfg,'--yes']);
-    assert.equal(r.status,0,r.stdout+'\n'+r.stderr);installed=true;
+    assert.equal(r.status,0,r.stdout+'\n'+r.stderr);
     assert(!r.stdout.includes('test-upstream-only'));
     console.log('PASS fresh '+(bundled?'bundled offline-copy':'npm-ci')+' install, patch, hook and startup with spaces/apostrophe in path');
     const connection=JSON.parse(fs.readFileSync(path.join(target,'connection.json')));
@@ -76,15 +86,59 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert.equal(merged.hooks.SessionStart[1].matcher,'startup|resume');
     assert.match(merged.hooks.SessionStart[1].hooks[0].command,/start-bridge\.sh' --hook$/);
     console.log('PASS private generated key/config, unrelated settings preserved');
+    const serviceFile=path.join(home,'.cccodroid/services/openai-bridge.json');
+    let service;
+    if(bundled){
+      service=JSON.parse(fs.readFileSync(serviceFile,'utf8'));
+      assert.equal(service.endpoint,connection.baseUrl);assert.equal(service.runtimeDir,target);
+      assert.equal(Object.keys(service).length,5);assert.match(service.instanceId,/^[0-9a-f]{32}$/);
+      assert.equal(fs.statSync(serviceFile).mode&0o777,0o600);
+    }else assert.equal(fs.existsSync(serviceFile),false);
     for(const url of ['', 'https://api.anthropic.com', connection.baseUrl+'@elsewhere.invalid', connection.baseUrl+'.evil.invalid']){
-      const foreign=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:url}});
+      const foreign=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...testEnv,ANTHROPIC_BASE_URL:url}});
       assert.equal(foreign.status,0,foreign.stderr);
       assert.equal(fs.existsSync(path.join(state,'watchdog.pid')),false);
       assert.equal(fs.existsSync(path.join(state,'.claude-code-router.pid')),false);
     }
     console.log('PASS foreign/empty endpoint cold Hooks do not start any bridge or watchdog');
+    if(bundled){
+      const ensure=['ensure','--dir',target,'--endpoint',service.endpoint,'--instance',service.instanceId];
+      const bad=await exec([...ensure.slice(0,-1),'0'.repeat(32)]);
+      assert.notEqual(bad.status,0);assert.equal(fs.existsSync(path.join(state,'watchdog.pid')),false);
+      const results=await Promise.all(Array.from({length:4},()=>exec(ensure)));
+      for(const rr of results){assert.equal(rr.status,0,rr.stderr);assert.deepEqual(JSON.parse(rr.stdout),{schema:1,id:'openai-bridge',ready:true,endpoint:service.endpoint,instanceId:service.instanceId});}
+      assert.equal((await fetch(connection.baseUrl+'/health')).status,200);
+      // Identity failures must precede every destructive action, including --purge.
+      const protectedFiles=[serviceFile,settings,path.join(target,'connection.json'),path.join(state,'watchdog.pid'),path.join(state,'.claude-code-router.pid')];
+      const protectedBytes=protectedFiles.map(file=>fs.readFileSync(file));
+      const invalidIdentities=[
+        ['--endpoint',service.endpoint,'--instance','0'.repeat(32)],
+        ['--endpoint',service.endpoint+'/v1','--instance',service.instanceId],
+        ['--endpoint','http://127.0.0.1:'+(new URL(service.endpoint).port==='65535'?65534:65535),'--instance',service.instanceId],
+        ['--endpoint',service.endpoint],
+        ['--instance',service.instanceId],
+        ['--endpoint',service.endpoint,'--instance','0'.repeat(32),'--purge'],
+      ];
+      for(const identity of invalidIdentities){
+        const denied=await exec(['uninstall','--dir',target,'--yes',...identity]);
+        assert.notEqual(denied.status,0,'uninstall must reject '+JSON.stringify(identity));
+        assert.equal(fs.existsSync(path.join(target,'disabled')),false,'bad identity must not disable runtime');
+        for(let i=0;i<protectedFiles.length;i++)assert.deepEqual(fs.readFileSync(protectedFiles[i]),protectedBytes[i],'bad identity changed '+protectedFiles[i]);
+        assert.equal((await fetch(connection.baseUrl+'/health',{signal:AbortSignal.timeout(1000)})).status,200,'bad identity must not stop service');
+      }
+      console.log('PASS uninstall rejects wrong/partial identity before disabled marker, stop, hook edit, registry removal or purge');
+      r=await exec(['stop','--dir',target,'--yes']);assert.equal(r.status,0,r.stderr);
+      assert.equal(await fetch(connection.baseUrl+'/health').then(()=>true,()=>false),false);
+      fs.writeFileSync(path.join(state,'recovery.failed'),'fixture fault\n');
+      const faulted=await exec(ensure);assert.notEqual(faulted.status,0);
+      r=await exec(['start','--dir',target,'--reset-recovery','--yes']);assert.equal(r.status,0,r.stderr);
+      assert.equal(fs.existsSync(path.join(state,'recovery.failed')),false);
+      r=await exec(['stop','--dir',target,'--yes']);assert.equal(r.status,0,r.stderr);
+      console.log('PASS registered ensure rejects wrong instance, waits for concurrent cold start and requires explicit recovery reset');
+    }
     const started=Date.now();
-    r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:connection.baseUrl+'/v1'}});
+    const appBaseUrl='http://127.0.0.1:45000/u/'+'0'.repeat(32)+'/'+Buffer.from(connection.baseUrl+'/v1').toString('base64url');
+    r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...testEnv,ANTHROPIC_BASE_URL:appBaseUrl}});
     assert.equal(r.status,0,r.stdout+r.stderr);assert.ok(Date.now()-started<3000,'Hook must not wait for readiness');
     let ready=false;
     for(let i=0;i<100;i++){
@@ -92,7 +146,7 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
       if(ready)break;await new Promise(resolve=>setTimeout(resolve,100));
     }
     assert.equal(ready,true,'real CCR did not become ready after cold Hook');
-    console.log('PASS matching cold Hook returns promptly and real patched CCR starts asynchronously');
+    console.log('PASS App-streamfix-wrapped cold Hook returns promptly and real patched CCR starts asynchronously');
     const response=await fetch(connection.baseUrl+'/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':connection.apiKey},body:JSON.stringify({model:'test-model',max_tokens:32,stream:true,messages:[{role:'user',content:'local test'}]})});
     const body=await response.text();
     assert.equal(response.status,200,body);assert(body.includes('KIT_LOCAL_TEST_OK'),body);assert(body.includes('message_stop'));
@@ -105,13 +159,28 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     r=await command('bash',[path.join(target,'status.sh')]);assert.equal(r.status,0,r.stderr);assert(r.stdout.includes('正常'));assert(!r.stdout.includes(connection.apiKey));
     console.log('PASS installed status wrapper works and keeps keys hidden');
     r=await exec(['install','--dir',target,'--settings',settings,'--config',cfg,'--yes']);assert.notEqual(r.status,0);assert(r.stderr.includes('不会覆盖'));
-    fs.appendFileSync(path.join(target,'start-bridge.sh'),'\n# user edit\n');
+    const startScript=path.join(target,'start-bridge.sh'),startBytes=fs.readFileSync(startScript);
+    fs.appendFileSync(startScript,'\n# user edit\n');
     r=await exec(['install','--dir',target,'--settings',settings,'--yes']);assert.notEqual(r.status,0);assert(r.stderr.includes('被修改'));
     console.log('PASS installer rejects configuration overwrite and modified scripts');
+    // Restore only this disposable fixture so valid scoped uninstall also proves
+    // the manager's integrity checks rather than failing on our mutation above.
+    fs.writeFileSync(startScript,startBytes);
+    if(bundled){
+      r=await exec(['uninstall','--dir',target,'--yes','--endpoint',service.endpoint,'--instance',service.instanceId]);
+      assert.equal(r.status,0,r.stderr);
+      console.log('PASS fixed component entry accepts matching endpoint/instance uninstall');
+    }
+    // The legacy, unscoped private wrapper remains a supported manual cleanup.
     r=await command('bash',[path.join(target,'uninstall.sh'),'--yes']);
-    assert.equal(r.status,0,r.stderr);installed=false;
+    assert.equal(r.status,0,r.stderr);
     assert.deepEqual(JSON.parse(fs.readFileSync(settings)),original);
     assert(fs.existsSync(path.join(target,'connection.json')));
+    assert(fs.existsSync(path.join(target,'disabled')));
+    if(bundled){
+      assert.equal(fs.existsSync(serviceFile),false);
+      const denied=await exec(['ensure','--dir',target,'--endpoint',service.endpoint,'--instance',service.instanceId]);assert.notEqual(denied.status,0);
+    }
     const health=await fetch(connection.baseUrl+'/health').then(()=>true,()=>false);assert.equal(health,false);
     console.log('PASS uninstall stops only isolated runtime, removes own hook, preserves data');
     // Simulate App removing the component entry while leaving the private runtime and Hook.
@@ -120,7 +189,7 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert.equal(manifest.componentEntry,componentEntry);
     fs.renameSync(componentEntry,removedEntry);
     try{
-      r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...process.env,ANTHROPIC_BASE_URL:connection.baseUrl}});
+      r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...testEnv,ANTHROPIC_BASE_URL:connection.baseUrl}});
       assert.equal(r.status,0,r.stdout+'\n'+r.stderr);
       assert.match(fs.readFileSync(path.join(state,'start.log'),'utf8'),/组件已卸载|入口不存在/);
       assert.equal(await fetch(connection.baseUrl+'/health').then(()=>true,()=>false),false);
@@ -139,11 +208,19 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     assert.equal(fs.statSync(sourceCli).ino,sourceStat.ino);
     assert.equal(fs.statSync(sourceCli).mtimeMs,sourceStat.mtimeMs);
     console.log('PASS source dependency bytes, inode and mtime remain unchanged');
-    console.log('PASS all installer end-to-end checks');
   }finally{
-    if(installed){const r=await exec(['stop','--dir',target,'--yes']);if(r.status!==0)console.error('cleanup stop failed:',r.stderr);}
-    await new Promise(r=>upstream.close(r));
+    let cleanupError;
+    // A failed install assertion can still leave a runtime; use only its own
+    // manager, even when normal component uninstall already removed its entry.
+    const manager=path.join(target,'manage.cjs');
+    if(fs.existsSync(manager)){
+      const r=await command(process.execPath,[manager,'uninstall','--dir',target,'--yes','--purge']);
+      if(r.status!==0)cleanupError=Error('fixture cleanup failed: '+JSON.stringify({status:r.status,signal:r.signal,timedOut:r.timedOut})+' '+r.stderr);
+    }
+    upstream.closeAllConnections();await new Promise(r=>upstream.close(r));
+    if(cleanupError)throw cleanupError;
     // 所有进程已停止，清理只属于本测试的临时目录。
     fs.rmSync(tmp,{recursive:true,force:true});
   }
+  console.log('PASS all installer end-to-end checks and fixture cleanup');
 })().catch(e=>{console.error(e);process.exitCode=1;});
