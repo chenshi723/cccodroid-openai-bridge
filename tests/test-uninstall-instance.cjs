@@ -169,7 +169,7 @@ test('current installer preserves manual cleanup without instance metadata or re
   });
 });
 
-test('scoped uninstall refuses a self-rehashed private common instead of executing it',()=>{
+test('published stale-file retirement never executes a self-rehashed private common',()=>{
   fixture(f=>{
     const userFile=path.join(f.root,'fake-user-note'),marker=path.join(f.target,'tampered-common-called');
     fs.writeFileSync(userFile,'keep fake user data\n');
@@ -177,11 +177,13 @@ test('scoped uninstall refuses a self-rehashed private common instead of executi
     fs.appendFileSync(common,`printf 'private code ran\\n' > ${api.quote(marker)}\nprintf 'overwritten\\n' > ${api.quote(userFile)}\n`);
     f.manifest.files['bridge-common.sh']=hash(fs.readFileSync(common));
     save(path.join(f.target,'.ccr-bridge-kit.json'),f.manifest);
-    const before=snapshot(f.root),r=f.run('component.cjs',f.scoped);
+    const privateBytes=fs.readFileSync(common),r=f.run('component.cjs',f.scoped);
     assert.equal(fs.existsSync(marker),false,'uninstall executed a self-authorized private shell script');
     assert.equal(fs.readFileSync(userFile,'utf8'),'keep fake user data\n');
-    assert.notEqual(r.status,0,r.stdout+r.stderr);
-    assert.deepEqual(snapshot(f.root),before);
+    assert.equal(r.status,0,r.stdout+r.stderr);
+    assert.deepEqual(fs.readFileSync(common),privateBytes);assert.equal(fs.existsSync(f.registry),false);
+    assert.equal(fs.readFileSync(path.join(f.target,'disabled'),'utf8'),'uninstalled\n');
+    assert.deepEqual(JSON.parse(fs.readFileSync(f.settings)),f.original);
   });
 });
 

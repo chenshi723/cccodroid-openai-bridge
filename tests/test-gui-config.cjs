@@ -37,7 +37,7 @@ function snapshot(root){
   const result={};function visit(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
     const p=path.join(dir,e.name),key=path.relative(root,p),st=fs.lstatSync(p);
     if(e.isDirectory()){result[key]={kind:'dir',ino:st.ino,mode:st.mode&0o777};visit(p);}
-    else result[key]={kind:e.isSymbolicLink()?'link':'file',ino:st.ino,mode:st.mode&0o777,data:e.isSymbolicLink()?fs.readlinkSync(p):fs.readFileSync(p,'base64')};
+    else result[key]={kind:e.isSymbolicLink()?'link':e.isFile()?'file':'special',ino:st.ino,mode:st.mode&0o777,data:e.isSymbolicLink()?fs.readlinkSync(p):e.isFile()?fs.readFileSync(p,'base64'):null};
   }}visit(root);return result;
 }
 function result(r){assert.equal(r.error,undefined,r.error?.message);assert.equal(r.status,0,r.stdout+r.stderr);assert.equal(r.stderr,'');return JSON.parse(r.stdout);}
@@ -53,16 +53,16 @@ function write(file,value){fs.writeFileSync(file,JSON.stringify(value,null,2)+'\
 
 test('GUI status without installation is nonsecret, read-only and never creates runtime',()=>fixture(f=>{
   const before=snapshot(f.home),r=f.run('gui-status'),v=result(r);
-  assert.deepEqual(v,{schema:1,id:'openai-bridge',configured:false,endpoint:'',model:'',hasKey:false,localReady:false});
+  assert.deepEqual(v,{schema:1,id:'openai-bridge',configured:false,endpoint:'',model:'',models:[],hasKey:false,localReady:false});
   assert.deepEqual(snapshot(f.home),before);
 }));
 
 test('first GUI save copies bundle privately, registers own instance, merges Hook and returns only connection path',()=>fixture(f=>{
   const bundle=snapshot(f.kit),{r,value}=saved(f);
-  assert.equal(value.endpoint,'https://api.example.invalid/v1/chat/completions');assert.equal(value.model,input.model);
+  assert.equal(value.endpoint,'https://api.example.invalid/v1/chat/completions');assert.equal(value.model,input.model);assert.deepEqual(value.models,[input.model]);
   assert.equal(value.connectionPath,path.join(f.target,'connection.json'));
   const c=JSON.parse(fs.readFileSync(value.connectionPath,'utf8')),m=JSON.parse(fs.readFileSync(path.join(f.target,'.ccr-bridge-kit.json'))),reg=JSON.parse(fs.readFileSync(f.registry));
-  assert.equal(m.guiManaged,true);
+  assert.equal(m.guiManaged,true);assert.equal(Object.hasOwn(c,'models'),false,'omitting models retains the old connection format');
   assert.match(c.apiKey,/^[0-9a-f]{48}$/);assert.notEqual(c.apiKey,upstreamKey);
   assert.equal(config(f).Providers[0].api_key,upstreamKey);assert.equal(config(f).APIKEY,c.apiKey);
   assert.equal(reg.runtimeDir,f.target);assert.equal(reg.instanceId,m.service.instanceId);assert.equal(reg.endpoint,c.baseUrl);
@@ -74,6 +74,64 @@ test('first GUI save copies bundle privately, registers own instance, merges Hoo
   assert.deepEqual(snapshot(f.kit),bundle);
   fs.writeFileSync(path.join(f.target,'node_modules/@musistudio/claude-code-router/fake-copy'),'private-change');
   assert.equal(fs.readFileSync(path.join(f.kit,'node_modules/@musistudio/claude-code-router/fake-copy'),'utf8'),'bundle-is-read-only');
+}));
+
+test('GUI multi-model save/status persist only IDs, keep default routes and retain instance/key integrity',()=>fixture(f=>{
+  const ids=['fixture-two',input.model,'模型-三'],{value,r}=saved(f,{...input,models:ids});
+  const connectionFile=path.join(f.target,'connection.json'),marker=path.join(f.target,'.ccr-bridge-kit.json');
+  const connection=JSON.parse(fs.readFileSync(connectionFile)),manifest=fs.readFileSync(marker),reg=fs.readFileSync(f.registry);
+  assert.deepEqual(value.models,ids);assert.deepEqual(connection.models,ids);assert.deepEqual(config(f).Providers[0].models,ids);
+  assert.equal(connection.model,input.model);assert(!r.stdout.includes(connection.apiKey));
+  for(const name of ['default','background','think','longContext','webSearch'])assert.equal(config(f).Router[name],'relay,'+input.model);
+  const before=snapshot(f.home),status=result(f.run('gui-status'));
+  assert.deepEqual(status.models,ids);assert.equal(status.model,input.model);assert.deepEqual(snapshot(f.home),before);
+  const nextIds=[input.model,'fixture-replacement'];
+  saved(f,{...input,apiKey:'',models:nextIds});
+  assert.deepEqual(config(f).Providers[0].models,nextIds);assert.deepEqual(JSON.parse(fs.readFileSync(connectionFile)).models,nextIds);
+  assert.equal(JSON.parse(fs.readFileSync(connectionFile)).apiKey,connection.apiKey);assert.equal(config(f).Providers[0].api_key,upstreamKey);
+  assert.deepEqual(fs.readFileSync(marker),manifest);assert.deepEqual(fs.readFileSync(f.registry),reg);
+  assert.equal(fs.existsSync(path.join(f.target,'runtime-home/.claude-code-router/service.lock')),true,'a models-only change must stop the validated runtime');
+  const noOp=snapshot(f.home);saved(f,{...input,apiKey:'',models:nextIds});
+  const afterNoOp=snapshot(f.home);delete noOp['.local/share/ccr-bridge-kit/start-called'];delete afterNoOp['.local/share/ccr-bridge-kit/start-called'];
+  assert.deepEqual(afterNoOp,noOp,'a repeated model list does not rewrite configuration');
+  const last=saved(f,{...input,apiKey:'',model:'fixture-replacement',models:nextIds}).value;
+  assert.equal(last.model,'fixture-replacement');assert.deepEqual(last.models,nextIds);assert.equal(config(f).Router.default,'relay,fixture-replacement');
+}));
+
+test('legacy single-model instances can explicitly add models and old clients can save single-model format',()=>fixture(f=>{
+  saved(f);const file=path.join(f.target,'connection.json');
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file)),'models'),false);
+  assert.deepEqual(result(f.run('gui-status')).models,[input.model]);
+  saved(f,{...input,apiKey:'',models:[input.model,'fixture-two']});
+  assert.deepEqual(result(f.run('gui-status')).models,[input.model,'fixture-two']);
+  const {value}=saved(f,{...input,apiKey:''});
+  assert.deepEqual(value.models,[input.model]);assert.deepEqual(config(f).Providers[0].models,[input.model]);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file)),'models'),false);
+}));
+
+test('GUI supports explicit singleton lists and restores the original omitted-list protocol shape',()=>fixture(f=>{
+  saved(f);const file=path.join(f.target,'connection.json');
+  saved(f,{...input,apiKey:'',models:[input.model]});
+  assert.deepEqual(JSON.parse(fs.readFileSync(file)).models,[input.model]);
+  assert.deepEqual(result(f.run('gui-status')).models,[input.model]);
+  saved(f,{...input,apiKey:''});assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file)),'models'),false);
+  assert.deepEqual(result(f.run('gui-status')).models,[input.model]);
+}));
+
+test('GUI accepts 100 bounded Unicode IDs even when the list exceeds the old 16 KiB input/file limits',()=>fixture(f=>{
+  const ids=Array.from({length:100},(_,i)=>'模'.repeat(190)+'-'+i),body={...input,model:ids[99],models:ids};
+  assert(Buffer.byteLength(JSON.stringify(body))>16384);
+  const {value}=saved(f,body);assert.deepEqual(value.models,ids);assert.deepEqual(config(f).Providers[0].models,ids);
+  assert.deepEqual(result(f.run('gui-status')).models,ids);
+  deny(f,'x'.repeat(128*1024+1),'INVALID_INPUT');
+}));
+
+test('GUI refuses invalid multi-model inputs before any filesystem change',()=>fixture(f=>{
+  for(const models of [null,{},'fixture-model',[],['other-model'],[input.model,input.model],[input.model,' '+input.model+' '],
+    ...[null,1,true,{},[],{id:'fixture-two',context_window:32768},'',' ','bad,model','bad\nmodel','bad\tmodel','bad\u0085model','x'.repeat(201)].map(id=>[input.model,id]),
+    Array.from({length:101},(_,i)=>i?'fixture-'+i:input.model)]){
+    deny(f,{...input,models},'INVALID_INPUT');
+  }
 }));
 
 test('regular CLI configure never marks a manual installation as GUI-managed or lets GUI take it over',()=>fixture(f=>{
@@ -91,7 +149,7 @@ test('regular CLI configure never marks a manual installation as GUI-managed or 
 
 test('GUI status exposes no old key or connection path and never starts/stops/writes',()=>fixture(f=>{
   saved(f);const before=snapshot(f.home),r=f.run('gui-status'),v=result(r),c=JSON.parse(fs.readFileSync(path.join(f.target,'connection.json')));
-  assert.deepEqual(v,{schema:1,id:'openai-bridge',configured:true,endpoint:'https://api.example.invalid/v1/chat/completions',model:input.model,hasKey:true,localReady:false});
+  assert.deepEqual(v,{schema:1,id:'openai-bridge',configured:true,endpoint:'https://api.example.invalid/v1/chat/completions',model:input.model,models:[input.model],hasKey:true,localReady:false,localError:'LOCAL_START_FAILED'});
   assert(!r.stdout.includes(upstreamKey));assert(!r.stdout.includes(c.apiKey));assert(!('connectionPath'in v));
   assert.deepEqual(snapshot(f.home),before);
 }));
@@ -148,16 +206,136 @@ test('GUI never overwrites unknown/default manual runtime or another registered 
     f=>{const m=JSON.parse(fs.readFileSync(path.join(f.target,'.ccr-bridge-kit.json')));delete m.service;write(path.join(f.target,'.ccr-bridge-kit.json'),m);},
     f=>{const m=JSON.parse(fs.readFileSync(path.join(f.target,'.ccr-bridge-kit.json')));m.componentEntry='/manual/component.cjs';write(path.join(f.target,'.ccr-bridge-kit.json'),m);},
     f=>fs.appendFileSync(path.join(f.target,'start-bridge.sh'),'# user edit\n'),
-    f=>fs.writeFileSync(path.join(f.target,'disabled'),'uninstalled\n'),
     f=>{const r=JSON.parse(fs.readFileSync(f.registry));r.instanceId='2'.repeat(32);write(f.registry,r);},
     f=>{const c=config(f);c.Providers[0].api_base_url='https://unexpected.invalid/private';write(path.join(f.target,'runtime-home/.claude-code-router/config.json'),c);},
     f=>{const file=path.join(f.target,'connection.json');fs.renameSync(file,file+'.actual');fs.symlinkSync(file+'.actual',file);}
   ])fixture(f=>{saved(f);mutate(f);deny(f,{...input,model:'changed'});const before=snapshot(f.home),r=f.run('gui-status');assert.equal(r.status,1);assert.deepEqual(snapshot(f.home),before);assert(!r.stderr.includes(upstreamKey));});
 });
 
-test('GUI refuses an upgraded component runtime mismatch without rewriting private runtime',()=>fixture(f=>{
-  saved(f);fs.appendFileSync(path.join(f.kit,'runtime/start-bridge.sh'),'# newer runtime incompatible\n');deny(f,{...input,model:'changed'});
+for(const multi of [false,true])test((multi?'multi-model':'legacy')+' ownership rejects inconsistent lists, links, manifest/PID/instance and key tampering',()=>{
+  const body={...input,...(multi?{models:[input.model,'fixture-two']}:{})};
+  const connection=f=>path.join(f.target,'connection.json'),configFile=f=>path.join(f.target,'runtime-home/.claude-code-router/config.json');
+  for(const mutate of [
+    f=>{const c=config(f);c.Providers[0].models.push('undeclared');write(configFile(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connection(f)));c.models=[input.model,'not-in-provider'];write(connection(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connection(f)));c.models=[input.model,input.model];write(connection(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connection(f)));c.models=[{id:input.model}];write(connection(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connection(f)));c.models=[' '+input.model+' '];write(connection(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connection(f)));c.apiKey=upstreamKey;write(connection(f),c);},
+    f=>{const c=config(f);c.Router.default='relay,other-model';write(configFile(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connection(f)));c.untrusted='extra';write(connection(f),c);},
+    f=>fs.chmodSync(connection(f),0o644),
+    f=>{const file=configFile(f);fs.renameSync(file,file+'.actual');fs.symlinkSync(file+'.actual',file);},
+    f=>fs.writeFileSync(path.join(f.target,'runtime-home/.claude-code-router/.claude-code-router.pid'),'not-a-pid\n'),
+    f=>{const marker=path.join(f.target,'.ccr-bridge-kit.json'),m=JSON.parse(fs.readFileSync(marker));m.files['patch-ccr.js']='0'.repeat(64);write(marker,m);fs.appendFileSync(path.join(f.target,'patch-ccr.js'),'// tampered private bytes\n');},
+    f=>{const marker=path.join(f.target,'.ccr-bridge-kit.json'),m=JSON.parse(fs.readFileSync(marker));m.service.instanceId='f'.repeat(32);write(marker,m);},
+    ...(multi?[f=>{const c=JSON.parse(fs.readFileSync(connection(f)));delete c.models;write(connection(f),c);}]:[])
+  ])fixture(f=>{
+    saved(f,body);mutate(f);deny(f,{...body,apiKey:'',model:input.model});
+    const before=snapshot(f.home),r=f.run('gui-status');assert.equal(r.status,1,r.stdout+r.stderr);
+    assert.equal(JSON.parse(r.stderr).error.code,'RUNTIME_CONFLICT');assert.deepEqual(snapshot(f.home),before);
+    assert(!r.stderr.includes(upstreamKey));
+  });
+});
+
+for(const multi of [false,true])for(const fileName of ['connection.json','runtime-home/.claude-code-router/config.json'])test((multi?'multi-model':'legacy')+' rejects hard-linked '+fileName+' where supported',t=>fixture(f=>{
+  const body={...input,...(multi?{models:[input.model,'fixture-two']}:{})};saved(f,body);
+  try{fs.linkSync(path.join(f.target,fileName),path.join(f.root,'outside-hardlink'));}
+  catch(error){if(['EACCES','EPERM','ENOTSUP'].includes(error.code)){t.skip('filesystem denies hard links');return;}throw error;}
+  deny(f,{...body,apiKey:''});const before=snapshot(f.home),r=f.run('gui-status');assert.equal(r.status,1);
+  assert.equal(JSON.parse(r.stderr).error.code,'RUNTIME_CONFLICT');assert.deepEqual(snapshot(f.home),before);
 }));
+
+for(const multi of [false,true])test((multi?'multi-model':'legacy')+' rejects synthetic multi-link metadata without writing config',()=>fixture(f=>{
+  const body={...input,...(multi?{models:[input.model,'fixture-two']}:{})};saved(f,body);
+  const hook=path.join(f.root,'nlink-hook.cjs');
+  fs.writeFileSync(hook,`const fs=require('node:fs'),original=fs.fstatSync;fs.fstatSync=function(fd){const st=original.apply(this,arguments);if(st.isFile()&&fs.readlinkSync('/proc/self/fd/'+fd)===${JSON.stringify(path.join(f.target,'connection.json'))})Object.defineProperty(st,'nlink',{value:2});return st;};`);
+  deny(f,{...body,apiKey:''},'RUNTIME_CONFLICT',{env:{NODE_OPTIONS:'--require='+hook}});
+}));
+
+test('published upgrade keeps read-only status safe, migrates owned runtime, and does not clear recovery locks',()=>fixture(f=>{
+  saved(f);const start=path.join(f.kit,'runtime/start-bridge.sh'),marker=path.join(f.target,'.ccr-bridge-kit.json');
+  fs.appendFileSync(start,'# newer component runtime\n');
+  const before=snapshot(f.home),status=result(f.run('gui-status'));assert.equal(status.localReady,false);assert.deepEqual(snapshot(f.home),before);
+  const fault=path.join(f.target,'runtime-home/.claude-code-router/recovery.failed'),attempts=path.join(f.target,'runtime-home/.claude-code-router/recovery.attempts');
+  fs.writeFileSync(fault,'recovery limit reached\n');fs.writeFileSync(attempts,'3\n');
+  const value=result(f.run('gui-configure',{...input,model:'changed'}));assert.equal(value.localError,'RECOVERY_EXHAUSTED');
+  assert.equal(fs.readFileSync(path.join(f.target,'start-bridge.sh'),'utf8'),fs.readFileSync(start,'utf8'));
+  assert.equal(JSON.parse(fs.readFileSync(marker)).files['start-bridge.sh'],require('node:crypto').createHash('sha256').update(fs.readFileSync(start)).digest('hex'));
+  assert.equal(fs.readFileSync(fault,'utf8'),'recovery limit reached\n');assert.equal(fs.readFileSync(attempts,'utf8'),'3\n');
+  assert.equal(fs.existsSync(path.join(f.target,'disabled')),false);
+}));
+
+for(const [reason,code] of [['recovery limit reached\n','RECOVERY_EXHAUSTED'],['patch verification failed\n','PATCH_VERIFICATION_FAILED'],['component removed or disabled\n','COMPONENT_DISABLED'],['unknown fixture fault\n','LOCAL_START_FAILED']])test('status and three saves preserve locked reason '+code+' despite healthy PID/HTTP',()=>fixture(f=>{
+  const common=path.join(f.kit,'runtime/bridge-common.sh');fs.writeFileSync(common,fs.readFileSync(common,'utf8').replace('bridge_pid() { return 1; }','bridge_pid() { return 0; }'));
+  const hook=path.join(f.root,'health-must-not-run.cjs');fs.writeFileSync(hook,"require('node:http').get=()=>{throw new Error('locked health must not be called');};");
+  result(f.run('gui-configure',input));
+  const fault=path.join(f.target,'runtime-home/.claude-code-router/recovery.failed'),attempts=path.join(f.target,'runtime-home/.claude-code-router/recovery.attempts');
+  fs.writeFileSync(fault,reason);fs.writeFileSync(attempts,'3\n');
+  const before=snapshot(f.home),status=result(f.run('gui-status',undefined,{env:{NODE_OPTIONS:'--require='+hook}}));
+  assert.equal(status.configured,true);assert.equal(status.localReady,false);assert.equal(status.localError,code);assert.deepEqual(snapshot(f.home),before);
+  const starts=fs.readFileSync(path.join(f.target,'start-called'),'utf8');
+  for(const model of [input.model,'changed-under-lock','changed-under-lock']){
+    const v=result(f.run('gui-configure',{...input,apiKey:'',model},{env:{NODE_OPTIONS:'--require='+hook}}));assert.equal(v.localError,code);assert.equal(v.localReady,false);
+    assert.equal(fs.readFileSync(fault,'utf8'),reason);assert.equal(fs.readFileSync(attempts,'utf8'),'3\n');assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),starts);
+  }
+}));
+
+for(const disabled of ['uninstalled\n','upgrading\n','configuring\n','disabled\n'])test('registered disabled is COMPONENT_DISABLED, not retired/conflict, and saves preserve marker '+disabled.trim(),()=>fixture(f=>{
+  saved(f);const file=path.join(f.target,'disabled');fs.writeFileSync(file,disabled);
+  const before=snapshot(f.home),status=result(f.run('gui-status'));assert.equal(status.configured,true);assert.equal(status.localError,'COMPONENT_DISABLED');assert.equal(status.localReady,false);assert.deepEqual(snapshot(f.home),before);
+  for(const model of [input.model,'edited-while-disabled','edited-while-disabled']){
+    const v=result(f.run('gui-configure',{...input,apiKey:'',model}));assert.equal(v.localReady,false);assert.equal(v.localError,'COMPONENT_DISABLED');assert.equal(fs.readFileSync(file,'utf8'),disabled);
+  }
+  assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),'start\n');
+}));
+
+test('published retired-directory flow still requires a fresh key and backs up data without executing it',()=>fixture(f=>{
+  saved(f);fs.writeFileSync(path.join(f.target,'disabled'),'uninstalled\n');fs.unlinkSync(f.registry);
+  const marker=path.join(f.target,'.ccr-bridge-kit.json'),m=JSON.parse(fs.readFileSync(marker));m.version='1.0.4';write(marker,m);
+  const originalConnection=fs.readFileSync(path.join(f.target,'connection.json'));
+  const before=snapshot(f.home),status=result(f.run('gui-status'));assert.equal(status.configured,false);assert.deepEqual(status.models,[]);assert.deepEqual(snapshot(f.home),before);
+  deny(f,{...input,apiKey:''},'KEY_REQUIRED');saved(f,{...input,apiKey:'fixture-reinstalled-key'});
+  const backups=fs.readdirSync(path.dirname(f.target)).filter(n=>n.startsWith('ccr-bridge-kit.uninstalled-'));assert.equal(backups.length,1);
+  const backup=path.join(path.dirname(f.target),backups[0]);assert.deepEqual(fs.readFileSync(path.join(backup,'connection.json')),originalConnection);assert.equal(fs.existsSync(path.join(backup,'node_modules')),false);
+  assert.equal(config(f).Providers[0].api_key,'fixture-reinstalled-key');
+}));
+
+test('canonical HOME and HOME alias manage the same default GUI/CLI instance without widening explicit target links',()=>fixture(f=>{
+  const alias=path.join(f.root,'home-alias');fs.symlinkSync(f.home,alias);
+  const initial=result(f.run('gui-configure',input,{env:{HOME:alias}}));assert.equal(initial.configured,true);assert.equal(initial.connectionPath,path.join(f.target,'connection.json'));
+  const before=snapshot(f.home);assert.equal(result(f.run('gui-status')).configured,true);assert.equal(result(f.run('gui-status',undefined,{env:{HOME:alias}})).configured,true);assert.deepEqual(snapshot(f.home),before);
+  const m=JSON.parse(fs.readFileSync(path.join(f.target,'.ccr-bridge-kit.json')));assert.equal(m.service.home,f.home);assert.equal(m.target,f.target);
+  const hook=path.join(f.root,'check-child-home.cjs');fs.writeFileSync(hook,`const cp=require('node:child_process'),original=cp.spawnSync;cp.spawnSync=function(bin,args,options){if(args?.[0]?.endsWith('/manage.cjs')&&options?.env?.HOME!==${JSON.stringify(f.home)})throw new Error('child HOME not canonical');return original.apply(this,arguments);};`);
+  const cli=f.run('status',undefined,{env:{HOME:alias,NODE_OPTIONS:'--require='+hook}});assert.equal(cli.status,0,cli.stdout+cli.stderr);
+  const endpoint=JSON.parse(fs.readFileSync(f.registry)).endpoint;
+  for(const HOME of [f.home,alias]){
+    const ready=f.run('ensure',undefined,{args:['--endpoint',endpoint,'--instance',m.service.instanceId],env:{HOME}});assert.equal(ready.status,0,ready.stdout+ready.stderr);assert.equal(JSON.parse(ready.stdout).ready,true);
+  }
+  const explicit=f.run('ensure',undefined,{args:['--dir',path.join(alias,'.local/share/ccr-bridge-kit'),'--endpoint',endpoint,'--instance',m.service.instanceId],env:{HOME:alias}});assert.equal(explicit.status,1);
+  saved(f,{...input,apiKey:''});assert.equal(result(f.run('gui-configure',{...input,apiKey:''},{env:{HOME:alias}})).configured,true);
+  const stop=f.run('uninstall',undefined,{args:['--endpoint',JSON.parse(fs.readFileSync(f.registry)).endpoint,'--instance',m.service.instanceId,'--yes'],env:{HOME:alias}});assert.equal(stop.status,0,stop.stdout+stop.stderr);assert.equal(fs.existsSync(f.registry),false);
+}));
+
+test('GUI rejects unsafe nested recovery markers before saving or probing and ignores unrelated root fault names',()=>{
+  for(const mutate of [
+    (f,file)=>fs.symlinkSync(path.join(f.root,'fake-private-note'),file),
+    (f,file)=>fs.writeFileSync(file,'x'.repeat(4097)),
+    (f,file)=>{const r=spawnSync('mkfifo',[file],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);}
+  ])fixture(f=>{
+    saved(f);fs.writeFileSync(path.join(f.root,'fake-private-note'),'fixture secret not to read');const file=path.join(f.target,'runtime-home/.claude-code-router/recovery.failed');mutate(f,file);
+    deny(f,{...input,model:'must-not-save'});const before=snapshot(f.home),status=f.run('gui-status');assert.equal(status.status,1,status.stdout+status.stderr);assert.deepEqual(snapshot(f.home),before);
+  });
+  fixture(f=>{
+    saved(f);fs.writeFileSync(path.join(f.target,'recovery.failed'),'recovery limit reached\n');const v=result(f.run('gui-configure',{...input,apiKey:''}));assert.equal(v.localError,'LOCAL_START_FAILED');assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),'start\nstart\n');
+  });
+});
+
+test('GUI never accepts symlink paths below the trusted HOME root',()=>{
+  for(const rel of ['.local','.claude','.cccodroid'])fixture(f=>{
+    const actual=path.join(f.root,'actual-'+rel.slice(1));fs.mkdirSync(actual);fs.symlinkSync(actual,path.join(f.home,rel));deny(f,input);
+  });
+});
 
 test('GUI ready status uses only validated literal loopback health and does not disclose secrets',()=>fixture(f=>{
   const common=path.join(f.kit,'runtime/bridge-common.sh');fs.writeFileSync(common,fs.readFileSync(common,'utf8').replace('bridge_pid() { return 1; }','bridge_pid() { return 0; }'));
@@ -200,6 +378,15 @@ test('GUI models blank key only reuses a healthy same-origin GUI secret without 
   }
 }));
 
+test('GUI models can reuse a multi-model owned same-origin key without probing or changing runtime',()=>fixture(f=>{
+  saved(f,{...input,models:[input.model,'fixture-two']});const before=snapshot(f.home);
+  assert.equal(result(models(f,{endpoint:input.endpoint})).models[0].id,'fixture-listed-model');
+  assert.deepEqual(snapshot(f.home),before);
+  const file=path.join(f.target,'connection.json'),connection=JSON.parse(fs.readFileSync(file));connection.models=[input.model];write(file,connection);
+  const tampered=snapshot(f.home),r=models(f,{endpoint:input.endpoint});assert.equal(r.status,1);
+  assert.equal(JSON.parse(r.stderr).error.code,'RUNTIME_CONFLICT');assert.deepEqual(snapshot(f.home),tampered);assert(!r.stderr.includes(upstreamKey));
+}));
+
 test('GUI models blank key rejects missing/manual/tampered runtime without any state changes',()=>{
   fixture(f=>{const before=snapshot(f.home),r=models(f,{endpoint:input.endpoint});assert.equal(r.status,1);assert.equal(JSON.parse(r.stderr).error.code,'KEY_REQUIRED');assert.deepEqual(snapshot(f.home),before);});
   for(const mutate of [
@@ -227,6 +414,13 @@ test('GUI rechecks registration after taking shared lock before any disabled/sto
   assert.equal(JSON.parse(fs.readFileSync(f.registry)).instanceId,'2'.repeat(32));
   assert.equal(fs.existsSync(path.join(f.target,'disabled')),false);assert.equal(fs.existsSync(path.join(f.target,'stop-called')),false);
   assert.deepEqual(fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json')),beforeConfig);assert.deepEqual(fs.readFileSync(path.join(f.target,'connection.json')),beforeConnection);
+}));
+
+test('GUI never replaces a concurrent explicit disabled marker with a temporary configuration marker',()=>fixture(f=>{
+  saved(f);const beforeConfig=fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json'));
+  const r=race(f,'lock',"fs.writeFileSync(target+'/disabled','uninstalled\\n');");assert.equal(r.status,1,r.stdout+r.stderr);
+  assert.equal(fs.readFileSync(path.join(f.target,'disabled'),'utf8'),'uninstalled\n');assert.deepEqual(fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json')),beforeConfig);
+  assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),'start\n');
 }));
 
 test('GUI refuses stale blank-key retention if private config changed while waiting for lock',()=>fixture(f=>{
@@ -260,7 +454,7 @@ test('GUI first install does not deploy if another registration appears during b
 }));
 
 for(const [name,existing,text,removed] of [
-  ['new temporary disabled marker',false,'component removed or disabled\n',true],
+  ['new legacy-watchdog temporary disabled fault (never auto-cleared)',false,'component removed or disabled\n',false],
   ['existing recovery exhaustion',true,'recovery limit reached\n',false],
   ['new unrelated recovery fault',false,'patch verification failed\n',false]
 ])test('GUI edit preserves recovery budget and handles '+name,()=>fixture(f=>{

@@ -54,29 +54,30 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
   const cfg=path.join(tmp,'private-config.json');
   const original={env:{KEEP:'value'},hooks:{SessionStart:[{matcher:'startup',hooks:[{type:'command',command:'printf keep-existing'}]}],Stop:[{hooks:[{type:'command',command:'printf keep-stop'}]}]}};
   fs.writeFileSync(settings,JSON.stringify(original));
+  const models=['test-model','test-nondefault','Org/Model-X','claude-haiku-explicit'],routedModels=[];
   const upstream=http.createServer((req,res)=>{
     let data='';req.on('data',b=>data+=b);req.on('end',()=>{
-      const body=JSON.parse(data);
-      assert.equal(body.model,'test-model');
+      const body=JSON.parse(data);routedModels.push(body.model);
+      assert(models.includes(body.model),'only configured models reach the loopback fixture');
       assert.equal(req.headers.authorization,'Bearer test-upstream-only');
-      const result={id:'test-id',model:'test-model',choices:[{index:0,message:{role:'assistant',content:'KIT_LOCAL_TEST_OK'},finish_reason:'stop'}],usage:{prompt_tokens:2,completion_tokens:3}};
+      const result={id:'test-id',model:body.model,choices:[{index:0,message:{role:'assistant',content:'KIT_LOCAL_TEST_OK'},finish_reason:'stop'}],usage:{prompt_tokens:2,completion_tokens:3}};
       res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(result));
     });
   });
   try{
     const upPort=await listen(upstream);
     const probe=net.createServer(),port=await listen(probe);await new Promise(r=>probe.close(r));
-    fs.writeFileSync(cfg,JSON.stringify({endpoint:`http://127.0.0.1:${upPort}/v1/chat/completions`,apiKey:'test-upstream-only',model:'test-model',port}),{mode:0o600});
+    fs.writeFileSync(cfg,JSON.stringify({endpoint:`http://127.0.0.1:${upPort}/v1/chat/completions`,apiKey:'test-upstream-only',model:'test-model',models,port}),{mode:0o600});
     let r=await exec(['install','--dir',target,'--settings',settings,'--config',cfg,'--yes']);
     assert.equal(r.status,0,r.stdout+'\n'+r.stderr);
     assert(!r.stdout.includes('test-upstream-only'));
     console.log('PASS fresh '+(bundled?'bundled offline-copy':'npm-ci')+' install, patch, hook and startup with spaces/apostrophe in path');
     const connection=JSON.parse(fs.readFileSync(path.join(target,'connection.json')));
-    assert.equal(connection.model,'test-model');assert(connection.apiKey.length>=40);
+    assert.equal(connection.model,'test-model');assert.deepEqual(connection.models,models);assert(connection.apiKey.length>=40);
     assert(!r.stdout.includes(connection.apiKey));
     const state=path.join(target,'runtime-home','.claude-code-router');
     const config=JSON.parse(fs.readFileSync(path.join(state,'config.json')));
-    assert.equal(config.Providers[0].api_key,'test-upstream-only');
+    assert.equal(config.Providers[0].api_key,'test-upstream-only');assert.deepEqual(config.Providers[0].models,models);assert.equal(config.Router.default,'relay,test-model');
     assert.equal(fs.statSync(path.join(state,'config.json')).mode&0o777,0o600);
     assert.equal(fs.statSync(path.join(target,'connection.json')).mode&0o777,0o600);
     const merged=JSON.parse(fs.readFileSync(settings));
@@ -150,7 +151,21 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     const response=await fetch(connection.baseUrl+'/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':connection.apiKey},body:JSON.stringify({model:'test-model',max_tokens:32,stream:true,messages:[{role:'user',content:'local test'}]})});
     const body=await response.text();
     assert.equal(response.status,200,body);assert(body.includes('KIT_LOCAL_TEST_OK'),body);assert(body.includes('message_stop'));
+    assert.deepEqual(routedModels,['test-model']);
     console.log('PASS installed real bridge routes local upstream JSON into client SSE');
+    for(const [model,extra,expected] of [
+      ['test-nondefault',{},'test-nondefault'],
+      ['Org/Model-X',{thinking:{type:'adaptive'},output_config:{effort:'high'}},'Org/Model-X'],
+      ['claude-haiku-explicit',{},'claude-haiku-explicit'],
+      ['relay,test-nondefault',{},'test-nondefault'],
+      ['unconfigured-model',{},'test-model']
+    ]){
+      const response=await fetch(connection.baseUrl+'/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':connection.apiKey},signal:AbortSignal.timeout(10000),body:JSON.stringify({model,max_tokens:32,stream:false,messages:[{role:'user',content:'local route test'}],...extra})});
+      const text=await response.text();assert.equal(response.status,200,text);
+      assert.equal(JSON.parse(text).model,expected);assert.equal(routedModels.at(-1),expected,'actual loopback upstream receives the selected ID, not the default');
+    }
+    assert.deepEqual(routedModels,['test-model','test-nondefault','Org/Model-X','claude-haiku-explicit','test-nondefault','test-model']);
+    console.log('PASS actual patched CCR forwards bare non-default, mixed-case, thinking and haiku IDs; legacy comma route and unknown-ID default remain compatible');
     const before=fs.readFileSync(path.join(state,'.claude-code-router.pid'),'utf8');
     r=await exec(['install','--dir',target,'--settings',settings,'--yes','--start']);
     assert.equal(r.status,0,r.stderr);assert.deepEqual(JSON.parse(fs.readFileSync(settings)),merged);

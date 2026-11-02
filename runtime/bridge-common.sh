@@ -22,10 +22,54 @@ bridge_log() {
   printf '[%s] %s %s\n' "$1" "$(date '+%F %T')" "$2" >> "$STATE/bridge.out"
 }
 
-# 只读本安装的元数据，不读取连接文件、上游配置或任何密钥。
-bridge_component_present() {
-  [[ ! -e "$BR/disabled" ]] || return 1
-  node -e 'try { const fs=require("node:fs"), path=require("node:path"); const root=process.argv[1], m=JSON.parse(fs.readFileSync(path.join(root,".ccr-bridge-kit.json"),"utf8")); if(m.id!=="ccr-bridge-kit"||m.target!==root||typeof m.componentEntry!=="string"||!path.isAbsolute(m.componentEntry)||!fs.statSync(m.componentEntry).isFile()) process.exit(1); } catch { process.exit(1); }' "$BR" 2>/dev/null
+# 只读非秘密元数据。0=完整，2=明确 disabled，3=仅固定入口暂缺，1=标记/路径无效。
+# 只对 ENOENT 启动有限确认；链接、坏文件、路径/实例变化绝不按“更新中”放行。
+bridge_component_state() {
+  [[ ! -e "$BR/disabled" && ! -L "$BR/disabled" ]] || return 2
+  node -e '
+    const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");
+    try {
+      const root=process.argv[1],file=path.join(root,".ccr-bridge-kit.json"),st=fs.lstatSync(file);
+      if(!st.isFile()||st.nlink!==1||st.size>65536||fs.realpathSync(root)!==root)process.exit(1);
+      const text=fs.readFileSync(file),m=JSON.parse(text);
+      if(m.id!=="ccr-bridge-kit"||m.target!==root||typeof m.componentEntry!=="string"||!path.isAbsolute(m.componentEntry)||path.resolve(m.componentEntry)!==m.componentEntry)process.exit(1);
+      const stamp=crypto.createHash("sha256").update(text).update(String(st.dev)+":"+st.ino).digest("hex");
+      if(process.argv[2]&&process.argv[2]!==stamp)process.exit(1);
+      console.log(stamp);
+      let entry;try{entry=fs.lstatSync(m.componentEntry);}catch(error){if(error.code==="ENOENT")process.exit(3);throw error;}
+      if(!entry.isFile()||entry.nlink!==1||fs.realpathSync(m.componentEntry)!==m.componentEntry)process.exit(1);
+    } catch { process.exit(1); }
+  ' "$BR" "${1:-}" 2>/dev/null
+}
+bridge_component_present() { bridge_component_state >/dev/null; }
+
+# 市场更新先移除固定入口再铺文件；只有“入口 ENOENT + 原元数据身份未变”可等一次。
+# 等待期间不修补、不停止/启动 CCR、不消费恢复预算；退出后绝不循环复活。
+bridge_component_confirm() {
+  local stamp rc deadline
+  stamp=$(bridge_component_state); rc=$?
+  (( rc == 3 )) || return "$rc"
+  bridge_log watchdog "固定组件入口暂缺，最多确认 10 秒；期间不重启"
+  deadline=$((SECONDS + 10))
+  while (( SECONDS < deadline )); do
+    [[ ! -e "$STATE/recovery.failed" && ! -L "$STATE/recovery.failed" ]] || return 1
+    sleep 0.2
+    bridge_component_state "$stamp" >/dev/null; rc=$?
+    (( rc == 3 )) || return "$rc"
+  done
+  return 3
+}
+
+# 安卓经加载器执行时（termux-exec 的 linker 模式），/proc/PID/exe 是系统 linker，
+# cmdline 是「原 argv0、真实程序绝对路径、原参数…」（真机实测）。exe 确是系统 linker 时
+# 丢掉原 argv0，用 termux-exec 插进来的真实路径当程序，再照原规则比对（#66 第 2 项）
+strip_linker() {
+  local exe
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 0
+  exe=${exe% (deleted)}   # apex 换版时旧 linker 已删
+  # 标准 AOSP 上 /apex/com.android.runtime 是链接，exe 读出来带 @版本号
+  [[ $exe = /system/bin/linker64 || $exe =~ ^/apex/com\.android\.runtime(@[^/]*)?/bin/linker64$ ]] && (( ${#args[@]} >= 2 )) && args=("${args[@]:1}")
+  return 0
 }
 
 # 不凭 PID 文件就杀进程：同时校验 Node、完整脚本路径（或原看护的相对路径 + cwd）。
@@ -35,6 +79,7 @@ bridge_process() {
   [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   { mapfile -d '' -t args < "/proc/$pid/cmdline"; } 2>/dev/null || return 1
+  strip_linker
   [[ ${#args[@]} -ge 3 && ${args[0]##*/} = node && ${args[2]} = start ]] || return 1
   [[ ${args[1]} = "$CLI" ]] && return 0
   [[ ${args[1]} = node_modules/@musistudio/claude-code-router/dist/cli.js ]] &&
@@ -51,7 +96,22 @@ bridge_pid() {
 
 bridge_healthy() {
   bridge_pid >/dev/null || return 1
-  node "$BR/health.cjs" "$PORT" 2>/dev/null
+  # 常规失败仅写有界 health.log；日志失效最多报一次固定诊断，绝不吞掉或无限重复追加。
+  if (( ${BRIDGE_HEALTH_LOG_FAILED:-0} )); then
+    node "$BR/health.cjs" "$PORT" --log "$STATE/health.log" 2>/dev/null
+  else
+    local diagnostic rc code
+    diagnostic=$(node "$BR/health.cjs" "$PORT" --log "$STATE/health.log" 2>&1); rc=$?
+    if [[ -n "$diagnostic" ]]; then
+      BRIDGE_HEALTH_LOG_FAILED=1
+      while IFS= read -r code; do
+        if [[ $code =~ ^\[[0-9TZ:.+-]+\]\ health\ ([A-Z][A-Z0-9_]*)$ ]]; then
+          printf '%s\n' "$code" >&2
+        fi
+      done <<< "$diagnostic"
+    fi
+    return "$rc"
+  fi
 }
 
 watchdog_running() {
@@ -62,6 +122,7 @@ watchdog_running() {
   [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   { mapfile -d '' -t args < "/proc/$pid/cmdline"; } 2>/dev/null || return 1
+  strip_linker
   [[ ${#args[@]} -ge 2 && ${args[0]##*/} = bash && ${args[1]} = "$BR/watchdog.sh" ]] || return 1
   # PID 仍在但锁已释放，也不能算一个有效的看护。
   ! flock -n "$STATE/watchdog.lock" true

@@ -23,19 +23,32 @@ FAILED_SINCE=$SECONDS
 LAST_START=$((-GRACE))
 HEALTHY_SINCE=-1
 ATTEMPTS=0
+LAST_FAILURE='recovery limit reached'
 if [[ -r "$STATE/recovery.attempts" ]]; then
   ATTEMPTS=$(< "$STATE/recovery.attempts")
   [[ "$ATTEMPTS" =~ ^[0-9]{1,3}$ ]] || ATTEMPTS=$RECOVERY_LIMIT
 fi
 [[ ! -e "$STATE/recovery.failed" ]] || exit 1
+# 明确 disabled（配置/升级/卸载）只停止看护，不制造需要 reset 的永久故障锁。
+# 真正缺失/无效才在有界确认后锁停；已有故障锁绝不覆盖、更不能自动清除。
+require_component() {
+  local rc
+  bridge_component_confirm; rc=$?
+  (( rc == 0 )) && return 0
+  if (( rc == 2 )); then
+    bridge_log watchdog "组件已明确停用；不再重启（保留既有恢复预算）"
+  else
+    if [[ ! -e "$STATE/recovery.failed" && ! -L "$STATE/recovery.failed" ]]; then
+      ( set -o noclobber; printf 'component removed or disabled\n' > "$STATE/recovery.failed" ) 2>/dev/null || true
+    fi
+    bridge_log watchdog "组件入口持续缺失或安装标记无效；不再重启，请用私有副本 uninstall.sh 清理"
+  fi
+  exit 0
+}
 exec 7> "$STATE/service.lock" || exit 1
 while :; do
   [[ ! -e "$STATE/recovery.failed" ]] || exit 1
-  if ! bridge_component_present; then
-    printf 'component removed or disabled\n' > "$STATE/recovery.failed"
-    bridge_log watchdog "组件已卸载或安装标记无效；不再重启，请用私有副本 uninstall.sh 清理"
-    exit 0
-  fi
+  require_component
   if [[ ! -e "$STATE/restart.request" ]] && bridge_healthy; then
     FAILURES=0
     FAILED_SINCE=$SECONDS
@@ -64,13 +77,14 @@ while :; do
     sleep 0.2
     continue
   fi
+  require_component
   if [[ ! -e "$STATE/restart.request" ]] && bridge_healthy; then
     flock -u 7
     continue
   fi
 
   if (( ATTEMPTS >= RECOVERY_LIMIT )); then
-    printf 'recovery limit reached\n' > "$STATE/recovery.failed"
+    printf '%s\n' "$LAST_FAILURE" > "$STATE/recovery.failed"
     bridge_log watchdog "自动恢复已停止：连续启动/修补尝试达到 $RECOVERY_LIMIT 次，需排查后显式重置"
     flock -u 7
     exit 1
@@ -84,12 +98,15 @@ while :; do
   timeout --kill-after=2 10 node "$BR/patch-ccr.js" >> "$STATE/start.log" 2>&1
   PATCHED=$?
   if [[ "$PATCHED" != 0 && "$PATCHED" != 2 ]]; then
+    LAST_FAILURE='patch verification failed'
     bridge_log watchdog "patch failed ($PATCHED); see $STATE/start.log"
     flock -u 7
     sleep "$INTERVAL"
     continue
   fi
 
+  LAST_FAILURE='recovery limit reached'
+  require_component
   PID=$(bridge_pid) || PID=
   if [[ -n "$PID" ]]; then
     bridge_log watchdog "restarting bridge PID $PID after patch or repeated health failures"
@@ -106,10 +123,7 @@ while :; do
     rm -f -- "$PIDFILE"
   fi
 
-  if ! bridge_component_present; then
-    bridge_log watchdog "组件已卸载或安装标记无效；取消本次启动，请用私有副本 uninstall.sh 清理"
-    exit 0
-  fi
+  require_component
   # 两个锁 FD 绝不能传给常驻子进程；否则看护退出后单例锁仍无法释放。
   bridge_log watchdog "starting bridge"
   setsid env -u CCAPP_RUN -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \

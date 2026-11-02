@@ -32,7 +32,7 @@ async function fixture(){
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
   const port=server.address().port;await new Promise(resolve=>server.close(resolve));
   const state=path.join(dir,'runtime-home/.claude-code-router');
-  fs.mkdirSync(state,{recursive:true});
+  fs.mkdirSync(state,{recursive:true,mode:0o700});
   for(const file of ['start-bridge.sh','bridge-common.sh','watchdog.sh','health.cjs'])fs.copyFileSync(path.join(root,'runtime',file),path.join(dir,file));
   const cli=path.join(dir,'node_modules/@musistudio/claude-code-router/dist/cli.js');
   fs.mkdirSync(path.dirname(cli),{recursive:true});
@@ -40,7 +40,7 @@ async function fixture(){
 const state=path.join(process.env.HOME,'.claude-code-router');
 fs.writeFileSync(path.join(state,'.claude-code-router.pid'),String(process.pid));
 fs.appendFileSync(path.join(state,'fake-starts'),'start\n');
-const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({status:'ok'}));});
+const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({status:fs.existsSync(path.join(state,'fake-unhealthy'))?'not-ok':'ok'}));});
 server.listen(Number(process.env.SERVICE_PORT),'127.0.0.1');
 process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
 `);
@@ -164,7 +164,7 @@ async function test(name,body){
     fs.unlinkSync(f.entry);
     const hook=await f.hook();assert.equal(hook.status,0,hook.stderr);
     const manual=await run('bash',[path.join(f.dir,'start-bridge.sh')],f.env);assert.notEqual(manual.status,0);
-    const watch=await run('bash',[path.join(f.dir,'watchdog.sh')],f.env);assert.equal(watch.status,0,watch.stderr);
+    const watch=await run('bash',[path.join(f.dir,'watchdog.sh')],f.env,15000);assert.equal(watch.status,0,watch.stderr);
     assert.match(fs.readFileSync(path.join(f.state,'start.log'),'utf8'),/组件已卸载/);
     assert.equal(fs.existsSync(path.join(f.dir,'patch-runs')),false);assert.equal(await f.healthy(),false);
   });
@@ -175,17 +175,21 @@ async function test(name,body){
   await test('component removed during patch prevents the pending spawn',async f=>{
     const r=await f.hook({HOOK_TEST_PATCH_DELAY:'900'});assert.equal(r.status,0,r.stderr);
     await until(()=>fs.existsSync(path.join(f.dir,'patch-runs')),'patch began');fs.unlinkSync(f.entry);
-    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'watchdog exits after component removal');
+    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'watchdog exits after component removal',15000);
     assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);assert.equal(await f.healthy(),false);
   });
   await test('running watchdog exits on component removal and cannot restart CCR',async f=>{
     assert.equal((await f.hook()).status,0);await until(f.healthy,'initial ready');
     const pid=f.alive('.claude-code-router.pid',f.cli);assert.ok(pid);fs.unlinkSync(f.entry);
-    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'watchdog stops rearming');
+    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'watchdog stops rearming',15000);
     assert.equal(await f.healthy(),true,'active request process should not be forcibly killed');
     process.kill(pid,'SIGTERM');await until(async()=>!await f.healthy(),'fake CCR stopped');
     assert.equal((await f.hook()).status,0);await sleep(400);
     assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim(),'start');
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.failed'),'utf8'),'component removed or disabled\n');
+    const attempts=fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8');fs.writeFileSync(f.entry,'// reappeared after bounded absence');
+    for(let i=0;i<3;i++)assert.equal((await f.hook()).status,0);await sleep(400);
+    assert.equal(await f.healthy(),false);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim(),'start');assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
   });
   await test('one unexpected exit recovers without starting duplicate watchdogs',async f=>{
     assert.equal((await f.hook()).status,0);await until(f.healthy,'initial ready');
@@ -233,6 +237,42 @@ async function test(name,body){
     const watch=await run('bash',[path.join(f.dir,'watchdog.sh')],f.env);assert.equal(watch.status,0);
     assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);
     assert.equal(await f.healthy(),false);
+  });
+  await test('entry missing briefly during market update neither locks recovery nor restarts a healthy bridge',async f=>{
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'update initial ready');
+    const watch=f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),attempts=fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8');
+    fs.unlinkSync(f.entry);await sleep(800);assert.equal(f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),watch);
+    assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+    fs.writeFileSync(f.entry,'// replacement fixed component');await sleep(800);
+    assert.equal(f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),watch);assert.equal(await f.healthy(),true);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+  });
+  await test('entry missing during patch is reconfirmed before touching the existing bridge',async f=>{
+    assert.equal((await f.hook({HOOK_TEST_PATCH_DELAY:'900'})).status,0);
+    await until(()=>fs.existsSync(path.join(f.dir,'patch-runs')),'update patch began');fs.unlinkSync(f.entry);await sleep(1200);
+    assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+    fs.writeFileSync(f.entry,'// restored fixed component');await until(f.healthy,'update restored ready');assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+  });
+  await test('disabled during the missing-entry grace stops promptly without new recovery locks or resurrection',async f=>{
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'disabled update initial ready');
+    const attempts=fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8');
+    fs.unlinkSync(f.entry);await sleep(400);fs.writeFileSync(path.join(f.dir,'disabled'),'uninstalled\n');
+    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'explicit disabled stops waiting');
+    fs.writeFileSync(f.entry,'// reappeared after uninstall');assert.equal((await f.hook()).status,0);await sleep(400);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+  });
+  await test('manifest identity changing during entry grace fails closed instead of reviving a replacement',async f=>{
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'manifest update initial ready');fs.unlinkSync(f.entry);await sleep(500);
+    const file=path.join(f.dir,'.ccr-bridge-kit.json'),m=JSON.parse(fs.readFileSync(file));m.unexpected='replacement';fs.writeFileSync(file,JSON.stringify(m));fs.writeFileSync(f.entry,'// replacement entry');
+    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'replacement metadata rejected');assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),true);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+  });
+  await test('real common health probe logs only safe bounded timestamped failures and leaves success quiet',async f=>{
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'health-log initial ready');
+    const watch=f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh'));process.kill(watch,'SIGTERM');await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'health-log watchdog stopped');
+    const file=path.join(f.state,'health.log'),probe=()=>run('bash',['-c','source "$1/bridge-common.sh" && bridge_healthy','health-fixture',f.dir],f.env);
+    const before=fs.existsSync(file)?fs.readFileSync(file,'utf8'):'';assert.equal((await probe()).status,0);assert.equal(fs.existsSync(file)?fs.readFileSync(file,'utf8'):'',before);
+    fs.writeFileSync(path.join(f.state,'fake-unhealthy'),'fixture-only');const failed=await probe();assert.equal(failed.status,1);assert.equal(failed.stdout+failed.stderr,'');
+    const text=fs.readFileSync(file,'utf8');assert.match(text,/\[[0-9TZ:.+-]+\] health HEALTH_STATUS\n/);assert.equal(text.includes('not-ok'),false);assert.equal(fs.statSync(file).mode&0o777,0o600);assert(fs.statSync(file).size<=65536);
   });
   console.log('PASS: '+passed+' isolated Hook lifecycle tests');
 })().catch(error=>{console.error(error);process.exitCode=1;});

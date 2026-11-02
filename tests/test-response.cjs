@@ -167,7 +167,7 @@ async function main() {
   const realCliBefore = fs.readFileSync(cliFile), realCliStat = fs.statSync(cliFile);
   const patch = fs.readFileSync(patchFile, "utf8");
   // 取补丁的纯字符串常量用于在临时副本还原原版/上一版，不执行补丁的文件 I/O 部分。
-  const names = ["EFF", "UE", "UR", "READER", "CANCEL", "H", "BODY", "AGENT", "STREAM", "TOOL_IMAGES", "IMAGE_TOKENS"];
+  const names = ["EFF", "UE", "UR", "READER", "CANCEL", "H", "BODY", "AGENT", "STREAM", "TOOL_IMAGES", "IMAGE_TOKENS", "REASON", "MODEL_ROUTE"];
   const keys = names.flatMap((name) => [name + "_OLD", name + "_NEW"]).concat(["SSE_OLD", "SSE_NEW", "SSE_FALLBACK", "SSE_MARK"]);
   const constants = vm.runInNewContext(patch.slice(patch.indexOf("const EFF_OLD"), patch.indexOf("\nlet src =")) + "\n({" + keys.join(",") + "});");
   let original = fs.readFileSync(cliFile, "utf8");
@@ -180,7 +180,8 @@ async function main() {
   let patched;
 
   const preImages = legacy.replace(constants.SSE_FALLBACK, constants.SSE_NEW).replace(constants.TOOL_IMAGES_NEW, constants.TOOL_IMAGES_OLD).replace(constants.IMAGE_TOKENS_NEW, constants.IMAGE_TOKENS_OLD);
-  for (const [name, source] of [["original", original], ["legacy-fallback", legacy], ["pre-image-fix", preImages]]) {
+  const preMultiModel = legacy.replace(constants.SSE_FALLBACK, constants.SSE_NEW).replace(constants.MODEL_ROUTE_NEW, constants.MODEL_ROUTE_OLD);
+  for (const [name, source] of [["original", original], ["legacy-fallback", legacy], ["pre-image-fix", preImages], ["pre-multi-model-fix", preMultiModel]]) {
     await test(name + ": patch exits 2 then 0; atomic replace, backup and other patches preserved", () => {
       const copy = fixture(name, source), before = fs.statSync(copy.cli);
       apply(copy, 2);
@@ -300,6 +301,64 @@ async function main() {
       assert.equal(fs.existsSync(copy.cli + ".orig"), false);
       noTemps(copy);
     }
+  });
+  function actualModelRouter(source) {
+    const start = source.indexOf('var getUseModel = async (req, tokenCount, config, lastUsage) => {');
+    const end = source.indexOf('\nvar router = ',start);
+    assert.ok(start > 0 && end > start,'actual pinned CCR model router boundaries');
+    return vm.runInNewContext(source.slice(start,end)+'\ngetUseModel;', {getProjectSpecificRouter:async()=>undefined});
+  }
+  await test('Actual unpatched CCR overrides bare non-default IDs; patched CCR preserves configured session selections', async () => {
+    const config = {Providers:[{name:'relay',models:['test-default','test-second','claude-haiku-explicit','Org/Model-X']}],Router:{default:'relay,test-default',think:'relay,test-default',background:'relay,test-default',longContext:'relay,test-default',webSearch:'relay,test-default',longContextThreshold:60000}};
+    const request = (model,extra={}) => ({body:{model,...extra},log:{info(){}}});
+    const before = actualModelRouter(original),after = actualModelRouter(patched);
+    assert.equal(await before(request('test-second'),1,config),config.Router.default,'unpatched negative control');
+    for(const id of config.Providers[0].models){
+      for(const extra of [{},{thinking:{type:'adaptive'}},{tools:[{type:'web_search_20250305'}]},{system:[{}, {text:'<CCR-SUBAGENT-MODEL>other,model</CCR-SUBAGENT-MODEL>'}]}]){
+        assert.equal(await after(request(id,extra),100000,config,{input_tokens:100000}),'relay,'+id);
+      }
+    }
+    for(const id of ['unconfigured-model','test-SECOND','org/model-x','claude-haiku-alias'])assert.equal(await after(request(id),1,config),config.Router.default);
+    assert.equal(await after(request('relay,test-second'),1,config),'relay,test-second','explicit legacy routing remains supported');
+    assert.equal(await after(request('other,test-second'),1,config),'other,test-second','patch never fabricates a relay match from a comma route');
+    assert.equal(await after(request('test-second'),1,{...config,Providers:[{name:'not-relay',models:['test-second']}]}),config.Router.default,'only this component relay is affected');
+  });
+  await test('An unknown CCR model-route anchor fails closed before any bundle write', () => {
+    const source = original.replace(constants.MODEL_ROUTE_OLD,constants.MODEL_ROUTE_OLD.replace('config.Router','config.UnexpectedRouter'));
+    assert.notEqual(source,original);
+    const copy = fixture('missing-model-route-anchor',source);
+    assert.match(apply(copy,1).stderr,/configured model route/);
+    assert.equal(fs.readFileSync(copy.cli,'utf8'),source);assert.equal(fs.existsSync(copy.cli+'.orig'),false);noTemps(copy);
+  });
+  function actualReasoningFetch(steps){
+    const start=patched.indexOf('    // ccr-reasoning-fallback-v1'),end=patched.indexOf('\n  })();',start);
+    assert.ok(start>0&&end>start,'actual published reasoning fallback boundaries');
+    const requests=[],queue=[...steps],context={Response,console,r:'https://fixture.invalid/v1/chat/completions',e:null,c:null,n:{warn(){}},o:{req:{id:'fixture'}}};
+    context.fetch=async(url,options)=>{requests.push({url,body:JSON.parse(options.body)});const step=queue.shift();assert.notEqual(step,undefined,'unexpected extra retry');if(step instanceof Error)throw step;return new Response(step.text,{status:step.status});};
+    const invoke=vm.runInNewContext('(() => {\n'+patched.slice(start,end)+'\n})',context);
+    return {requests,async send(body){context.e=body;context.c={body:JSON.stringify(body)};return await invoke();}};
+  }
+  await test('Published reasoning fallback strips once and remembers each URL/model without changing selected model',async()=>{
+    const fake=actualReasoningFetch([{status:400,text:'Invalid request payload'},{status:200,text:'ok'},{status:200,text:'cached'},{status:200,text:'other'}]);
+    const body={model:'selected-nondefault',reasoning_effort:'high',reasoning:{effort:'high'},stream:false};
+    assert.equal(await (await fake.send(body)).text(),'ok');assert.equal(await (await fake.send(body)).text(),'cached');
+    assert.equal(await (await fake.send({...body,model:'different-model'})).text(),'other');
+    assert.equal(fake.requests.length,4);assert.equal(fake.requests[0].body.reasoning_effort,'high');
+    for(const i of [1,2]){assert.equal(fake.requests[i].body.model,'selected-nondefault');assert.equal('reasoning'in fake.requests[i].body,false);assert.equal('reasoning_effort'in fake.requests[i].body,false);}
+    assert.equal(fake.requests[3].body.reasoning_effort,'high');assert.equal(body.reasoning_effort,'high');
+  });
+  await test('Published reasoning fallback preserves the first 400 on retry HTTP/network failure and skips non-parameter errors',async()=>{
+    for(const second of [{status:503,text:'later failed'},new Error('fake network failed')]){
+      const fake=actualReasoningFetch([{status:400,text:'Invalid request payload FIRST'},second]);
+      const response=await fake.send({model:'selected',reasoning_effort:'high'});assert.equal(response.status,400);assert.equal(await response.text(),'Invalid request payload FIRST');assert.equal(fake.requests.length,2);
+    }
+    for(const body of [{model:'selected',reasoning_effort:'high'},{model:'selected'}]){
+      const fake=actualReasoningFetch([{status:400,text:'daily quota exhausted'}]);const response=await fake.send(body);assert.equal(response.status,400);assert.equal(await response.text(),'daily quota exhausted');assert.equal(fake.requests.length,1);
+    }
+  });
+  await test('Published reasoning fallback rejects ambiguous anchors without touching the bundle',()=>{
+    const source=original+'\n// another anchor'+constants.REASON_OLD,copy=fixture('ambiguous-reasoning-anchor',source);
+    assert.match(apply(copy,1).stderr,/reasoning fallback \(anchor not unique\)/);assert.equal(fs.readFileSync(copy.cli,'utf8'),source);assert.equal(fs.existsSync(copy.cli+'.orig'),false);noTemps(copy);
   });
   const transformer = extract(patched);
   await test("Request stream:false and effort patches still execute normally", async () => {

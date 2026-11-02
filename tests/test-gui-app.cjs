@@ -14,7 +14,7 @@ for(const name of ['node','bash','sh','flock','timeout','setsid','readlink','tee
 }
 const component=path.join(prefix,'lib/openai-bridge');
 fs.mkdirSync(component);
-for(const name of ['installer.cjs','component.cjs','package.json','package-lock.json'])fs.copyFileSync(path.join(source,name),path.join(component,name));
+for(const name of ['installer.cjs','component.cjs','gui-models.cjs','package.json','package-lock.json'])fs.copyFileSync(path.join(source,name),path.join(component,name));
 fs.cpSync(path.join(source,'runtime'),path.join(component,'runtime'),{recursive:true});
 fs.cpSync(path.join(source,'node_modules'),path.join(component,'node_modules'),{recursive:true,verbatimSymlinks:true});
 const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>['PATH','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD'].includes(key)));
@@ -63,9 +63,28 @@ async function childTest(){
     const checked=await request();assert.equal(checked.status,200);assert.equal(checked.body.providerId,saved.body.providerId);assert.equal(checked.body.local.state,'ready');
     const updated=await request({endpoint:input.endpoint,model:'fixture-gui-second',consent:true});assert.equal(updated.status,200);assert.equal(updated.body.ok,true);assert.equal(updated.body.providerId,saved.body.providerId);assert.equal(updated.body.local.state,'ready');
     assert.equal(providers.PROVIDERS_CFG.providers[saved.body.providerId].defaultModel,'fixture-gui-second');assert.equal(providers.PROVIDER.id,initial.provider);assert.equal(SETTINGS.provider,initial.setting);
+    const models=[{id:'fixture-gui-first',contextWindow:1048576},{id:'fixture-gui-second',contextWindow:128000},{id:'fixture-gui-unknown',contextWindow:200000}];
+    const multi=await request({endpoint:input.endpoint,model:models[0].id,models,consent:true});
+    assert.equal(multi.status,200,JSON.stringify(multi.body));assert.equal(multi.body.localReady,true);assert.deepEqual(multi.body.models,models);
+    const modelApi=await import(pathToFileURL(path.join(dir,'models.mjs')));
+    for(const m of models){
+      let output;const u=new URL('http://127.0.0.1/api/models?provider='+multi.body.providerId+'&model='+m.id);
+      await modelApi.routeModels({method:'GET'},{writeHead(){},end(text){output=JSON.parse(text);}},u,u.pathname);
+      assert.equal(output.contextWindow,m.contextWindow);assert.deepEqual(output.models.map(x=>x.id),models.map(x=>x.id));
+    }
+    // 实际本地 CCR 仍健康但恢复锁存在：GUI/网关必须与 start/ensure 的阻断语义一致。
+    const stateDir=path.join(target,'runtime-home/.claude-code-router'),fault=path.join(stateDir,'recovery.failed'),attempts=path.join(stateDir,'recovery.attempts');
+    const localHealthy=await fetch(connection.baseUrl+'/health');assert.equal(localHealthy.status,200);await localHealthy.body?.cancel();
+    fs.writeFileSync(fault,'recovery limit reached\n',{mode:0o600});fs.writeFileSync(attempts,'3\n',{mode:0o600});
+    const blocked=await request();assert.equal(blocked.body.localReady,false);assert.equal(blocked.body.localError,'RECOVERY_EXHAUSTED');assert.equal(blocked.body.local.state,'error');
+    for(let i=0;i<3;i++){
+      const locked=await request({endpoint:input.endpoint,model:models[0].id,models,consent:true});
+      assert.equal(locked.status,200,JSON.stringify(locked.body));assert.equal(locked.body.configured,true);assert.equal(locked.body.localReady,false);assert.equal(locked.body.localError,'RECOVERY_EXHAUSTED');
+      assert.equal(fs.readFileSync(fault,'utf8'),'recovery limit reached\n');assert.equal(fs.readFileSync(attempts,'utf8'),'3\n');
+    }
     const denied=await request({endpoint:'https://elsewhere.example.invalid/v1',model:'fixture-gui-second',consent:true});assert.equal(denied.status,400);assert.equal(denied.body.field,'apiKey');
     const settings=JSON.parse(fs.readFileSync(path.join(process.env.HOME,'.claude/settings.json'),'utf8'));assert.equal(settings.hooks.SessionStart.length,1);
-    console.log(JSON.stringify({ok:true,scope:'real App route + component GUI + private real CCR; no model request',localReady:true,providerCreated:true,providerUpdated:true,currentProviderPreserved:true,oldKeyNotReturned:true,changedOriginKeyRequired:true}));
+    console.log(JSON.stringify({ok:true,scope:'real App route + component GUI + private real CCR; no model request',normalLocalReady:true,providerCreated:true,providerUpdated:true,currentProviderPreserved:true,oldKeyNotReturned:true,changedOriginKeyRequired:true,multiModels:3,individualWindows:true,healthyResidualBlocked:true,recoveryLockedSaves:3,recoveryFlagsPreserved:true}));
   }finally{await new Promise(r=>server.close(r));}
 }
 (async()=>{

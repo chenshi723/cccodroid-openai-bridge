@@ -51,6 +51,18 @@ function normalizeInput(input){
     return {endpoint,apiKey};
   }catch{throw guiError('INVALID_INPUT');}
 }
+const CONTEXT_FIELDS=['context_window','contextWindow','max_input_tokens','context_length','max_context_tokens'];
+function contextWindow(entry,apiKey){
+  // Only explicit input/context capacities, never max_tokens (usually output limit).
+  // A finite whitelist also prevents arbitrary upstream metadata from crossing the boundary.
+  for(const source of [entry,entry.top_provider]){
+    if(!object(source))continue;
+    for(const field of CONTEXT_FIELDS){
+      const value=Object.hasOwn(source,field)?source[field]:undefined;
+      if(typeof value==='number'&&Number.isInteger(value)&&value>=1024&&value<=16777216&&!String(value).includes(apiKey))return value;
+    }
+  }
+}
 function modelsResult(body,apiKey){
   let payload;
   try{payload=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(body));}
@@ -65,7 +77,8 @@ function modelsResult(body,apiKey){
     // A hostile upstream may echo the credential as an id, including a reused key
     // the GUI must never receive. Filter it before counting or returning models.
     if(!id||id.length>200||id.includes(apiKey)||seen.has(id))continue;
-    const model={id},extra=Buffer.byteLength(JSON.stringify(model))+(result.models.length?1:0);
+    const context_window=contextWindow(entry,apiKey);
+    const model={id,...(context_window===undefined?{}:{context_window})},extra=Buffer.byteLength(JSON.stringify(model))+(result.models.length?1:0);
     if(result.models.length===MAX_MODELS||bytes+extra>MAX_RESULT_BYTES){result.truncated=true;break;}
     seen.add(id);result.models.push(model);bytes+=extra;
   }
