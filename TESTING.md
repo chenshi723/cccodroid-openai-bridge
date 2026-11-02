@@ -1,5 +1,18 @@
 # Verification record — preview proposal
 
+## Gemini thought-signature candidate — 1.0.5-r17, 2026-11-03
+
+Adds patch 14 (`ccr-thought-signature-v1`) for cccodroid #91: Gemini 3 OpenAI-compatible endpoints return 400 when an assistant tool call is replayed without its `extra_content.google.thought_signature`. Only `runtime/patch-ccr.js`, its response regression test, recipe revision/notes, SKILL and README change; installer, watchdog, dependencies and lockfile are unchanged.
+
+- Response side (inside the existing JSON/SSE wrapper): streamed and JSON tool-call signatures are remembered by tool-call id in a process-local FIFO map (**1024** entries, **64 KiB** per signature, strings only), tagged with the upstream model written on the Fastify request by the request side. Nothing is added to the Anthropic output.
+- Request side (entry of CCR's final `Gf` fetch): a remembered signature is returned only when the outgoing model string equals the recorded one. If the model name contains `gemini` and a step has no signature at all (bridge restart, model switch), its first call gets Google's documented `skip_thought_signature_validator`. Other models get no field; with nothing to change the original body object is returned. The request body is never mutated, and the reasoning-parameter retry (patch 11) resends the signed body.
+- The five anchors (four inside the patch-8 text, one in `Gf`) must each occur exactly once, otherwise the patch fails closed before any write; already-patched r16 bundles receive the addition on the next run.
+- `tests/test-response.cjs`: **92/92** (84 existing + 8 new: streamed parallel calls, JSON stream=false/true, id/signature in different fragments, published `Gf` first attempt + reasoning retry, placeholder per step / non-Gemini untouched, bounds/types/size, missing/duplicate anchors). Negative controls: disabling the patch application, disabling the same-model refill, or dropping the `e` reassignment each fail at the expected assertions; the `Gf` test also fails alone when the model differs.
+- Also passing locally: installer, security, gui-models, selftest **4/4**. On this Android device `test-registration`, `test-health`, `test-uninstall-instance`, `test-gui-config` and `test-hooks` fail identically on unchanged r16 (`e8a70d1`) for environment reasons (no `/bin/bash`, child `node` missing `libz.so.1`, a live registration, log-lock timing); they are not counted as passes. The standalone/bundled install E2E and the Python integration test were not run locally. Hosted CI must validate the full suite.
+- An independent DeepSeek v4-pro static review found no required change; adopted: `null` guard on the placeholder and two extra tests; the single-relay/model-name assumption is documented in the patch comment.
+
+Not covered: a real Gemini endpoint (no paid or live request was made), signed package install, native App acceptance.
+
 ## Review follow-up candidate — 1.0.5-r16, 2026-11-02
 
 This section supersedes r15 for the changed installer/watchdog and candidate recipe. App PR #86 is merged at `051a719e1d24623350fd1d3099c8e2c314379bb9`; its main-branch workflow `41446562720` passed gateway tests (515 pass, one existing skip) and the release build. The tested paired-App commit `35460a6` and official merge have the identical Git tree `3a611fe45da97d5af6fe97c8f826ea5b4241d94c`, checked against the GitHub commit API rather than inferred from PR status. This does not mean that an APK or component was installed for acceptance. Component PR #2 and market PR #62 remain subject to normal CI and human review; the historical r15 publication-blocked note below is not their current state.
