@@ -281,13 +281,97 @@ for(const [reason,code] of [['recovery limit reached\n','RECOVERY_EXHAUSTED'],['
   }
 }));
 
-for(const disabled of ['uninstalled\n','upgrading\n','configuring\n','disabled\n'])test('registered disabled is COMPONENT_DISABLED, not retired/conflict, and saves preserve marker '+disabled.trim(),()=>fixture(f=>{
+for(const disabled of ['uninstalled\n','upgrading\n','disabled\n','configuring','configuring\r\n','configuring\nx'])test('registered disabled is COMPONENT_DISABLED, not retired/conflict, and saves preserve marker '+JSON.stringify(disabled),()=>fixture(f=>{
   saved(f);const file=path.join(f.target,'disabled');fs.writeFileSync(file,disabled);
   const before=snapshot(f.home),status=result(f.run('gui-status'));assert.equal(status.configured,true);assert.equal(status.localError,'COMPONENT_DISABLED');assert.equal(status.localReady,false);assert.deepEqual(snapshot(f.home),before);
   for(const model of [input.model,'edited-while-disabled','edited-while-disabled']){
     const v=result(f.run('gui-configure',{...input,apiKey:'',model}));assert.equal(v.localReady,false);assert.equal(v.localError,'COMPONENT_DISABLED');assert.equal(fs.readFileSync(file,'utf8'),disabled);
   }
   assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),'start\n');
+}));
+
+for(const changed of [false,true])test('explicit save recovers an interrupted configuring marker '+(changed?'with edited input':'without changing input')+' without clearing recovery budget',()=>fixture(f=>{
+  saved(f);const file=path.join(f.target,'disabled'),attempts=path.join(f.target,'runtime-home/.claude-code-router/recovery.attempts');
+  fs.writeFileSync(file,'configuring\n');fs.writeFileSync(attempts,'2\n');
+  const identity=fs.readFileSync(f.registry),before=snapshot(f.home),status=result(f.run('gui-status'));
+  assert.equal(status.localError,'COMPONENT_DISABLED');assert.deepEqual(snapshot(f.home),before,'status is read-only; only an explicit save can finish an interrupted configuration');
+  const body={...input,apiKey:'',model:changed?'after-crash':input.model};
+  const value=result(f.run('gui-configure',body));
+  assert.equal(value.localError,'LOCAL_START_FAILED','fixture has no healthy service, but no longer reports a stale disabled marker');
+  assert.equal(fs.existsSync(file),false);assert.equal(fs.readFileSync(attempts,'utf8'),'2\n');assert.deepEqual(fs.readFileSync(f.registry),identity);
+  assert.equal(config(f).Router.default,'relay,'+body.model);assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),'start\nstart\n');
+  assert.equal(fs.existsSync(path.join(f.target,'runtime-home/.claude-code-router/service.lock')),true,'even a no-op recovery must stop the verified old runtime before clearing the marker');
+}));
+
+test('a GUI process killed after stopping can finish its temporary configuration on the next save',()=>fixture(f=>{
+  saved(f);const beforeConfig=fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json')),identity=fs.readFileSync(f.registry);
+  const r=race(f,'stop',"process.kill(process.pid,'SIGKILL');",{...input,apiKey:'',model:'interrupted-edit'});
+  assert.notEqual(r.status,0);assert.equal(fs.readFileSync(path.join(f.target,'disabled'),'utf8'),'configuring\n');
+  assert.deepEqual(fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json')),beforeConfig);
+  const value=result(f.run('gui-configure',{...input,apiKey:'',model:'after-killed-editor'}));
+  assert.equal(value.localError,'LOCAL_START_FAILED');assert.equal(fs.existsSync(path.join(f.target,'disabled')),false);
+  assert.equal(config(f).Router.default,'relay,after-killed-editor');assert.deepEqual(fs.readFileSync(f.registry),identity);
+}));
+
+for(const phase of ['config','connection'])test('a killed GUI write '+phase+' resumes only a validated configuring transaction on explicit save',()=>fixture(f=>{
+  saved(f);const hook=path.join(f.root,'killed-write.cjs'),targetFile=path.join(f.target,phase==='config'?'runtime-home/.claude-code-router/config.json':'connection.json');
+  fs.writeFileSync(hook,`const fs=require('node:fs'),rename=fs.renameSync;fs.renameSync=function(from,to){const result=rename.apply(this,arguments);if(to===${JSON.stringify(targetFile)})process.kill(process.pid,'SIGKILL');return result;};`);
+  const body={...input,apiKey:'',model:'interrupted-new-default',models:['interrupted-new-default','second-after-crash']};
+  const r=f.run('gui-configure',body,{env:{NODE_OPTIONS:'--require='+hook}});assert.notEqual(r.status,0);
+  assert.equal(fs.readFileSync(path.join(f.target,'disabled'),'utf8'),'configuring\n');
+  const before=snapshot(f.home),status=result(f.run('gui-status'));assert.equal(status.localReady,false);assert.equal(status.localError,'COMPONENT_DISABLED');assert.deepEqual(snapshot(f.home),before);
+  const value=result(f.run('gui-configure',body));assert.equal(value.model,body.model);assert.deepEqual(value.models,body.models);assert.equal(value.localError,'LOCAL_START_FAILED');
+  assert.equal(fs.existsSync(path.join(f.target,'disabled')),false);assert.equal(config(f).Router.default,'relay,'+body.model);
+  const connection=JSON.parse(fs.readFileSync(path.join(f.target,'connection.json')));assert.equal(connection.model,body.model);assert.deepEqual(connection.models,body.models);
+}));
+
+for(const name of ['local-key','router','extra-field'])test('configuring residue still refuses malformed or foreign runtime config '+name,()=>fixture(f=>{
+  saved(f);fs.writeFileSync(path.join(f.target,'disabled'),'configuring\n');
+  const value=config(f);if(name==='local-key')value.APIKEY='f'.repeat(48);else if(name==='router')value.Router.background='foreign,model';else value.untrusted=true;
+  write(path.join(f.target,'runtime-home/.claude-code-router/config.json'),value);
+  deny(f,{...input,apiKey:'',model:'do-not-save'});
+}));
+
+for(const marker of [null,'uninstalled\n','upgrading\n','disabled\n','configuring','configuring\r\n','configuring\nx'])test('split canonical configurations cannot resume without the exact transaction marker '+JSON.stringify(marker),()=>fixture(f=>{
+  saved(f);const previous=config(f),next=api.routerConfig(api.validateConfig({...input,endpoint:previous.Providers[0].api_base_url,model:'uncommitted'},previous.PORT),previous.PORT,previous.APIKEY);
+  write(path.join(f.target,'runtime-home/.claude-code-router/config.json'),next);if(marker!==null)fs.writeFileSync(path.join(f.target,'disabled'),marker);
+  deny(f,{...input,apiKey:'',model:'do-not-save'});
+}));
+
+for(const inherited of [false,true])test('a concurrent canonical config replacement cannot clear the transaction marker '+inherited,()=>fixture(f=>{
+  saved(f);const file=path.join(f.target,'disabled'),configFile=path.join(f.target,'runtime-home/.claude-code-router/config.json'),old=fs.readFileSync(configFile,'utf8');
+  if(inherited)fs.writeFileSync(file,'configuring\n');
+  const hook=path.join(f.root,'replaced-during-commit.cjs');
+  fs.writeFileSync(hook,`const fs=require('node:fs'),rename=fs.renameSync;let changed=false;fs.renameSync=function(from,to){const result=rename.apply(this,arguments);if(!changed&&to===${JSON.stringify(path.join(f.target,'connection.json'))}){changed=true;fs.writeFileSync(${JSON.stringify(configFile)},${JSON.stringify(old)});}return result;};`);
+  const r=f.run('gui-configure',{...input,apiKey:'',model:'requested-new-model'},{env:{NODE_OPTIONS:'--require='+hook}});assert.equal(r.status,1);
+  assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),'start\n');
+  // 可回滚时恢复成对旧配置；继承的临时标记保留，不能出现无标记的分裂配置。
+  const checked=result(f.run('gui-status'));assert.equal(checked.configured,true);assert.equal(checked.model,input.model);
+  assert.equal(fs.existsSync(file),inherited);if(inherited)assert.equal(fs.readFileSync(file,'utf8'),'configuring\n');
+  const retried=result(f.run('gui-configure',{...input,apiKey:'',model:'requested-new-model'}));assert.equal(retried.model,'requested-new-model');assert.equal(fs.existsSync(file),false);
+}));
+
+test('interrupted configuring cleanup never clears a recovery fault',()=>fixture(f=>{
+  saved(f);const file=path.join(f.target,'disabled'),fault=path.join(f.target,'runtime-home/.claude-code-router/recovery.failed'),attempts=path.join(f.target,'runtime-home/.claude-code-router/recovery.attempts');
+  fs.writeFileSync(file,'configuring\n');fs.writeFileSync(fault,'recovery limit reached\n');fs.writeFileSync(attempts,'3\n');
+  const value=result(f.run('gui-configure',{...input,apiKey:''}));
+  assert.equal(value.localError,'RECOVERY_EXHAUSTED');assert.equal(value.localReady,false);assert.equal(fs.existsSync(file),false);
+  assert.equal(fs.readFileSync(fault,'utf8'),'recovery limit reached\n');assert.equal(fs.readFileSync(attempts,'utf8'),'3\n');
+  assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),'start\n');
+}));
+
+test('failed resume of configuring leaves the inherited marker for another explicit save',()=>fixture(f=>{
+  saved(f);const file=path.join(f.target,'disabled');fs.writeFileSync(file,'configuring\n');
+  const beforeConfig=fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json'));
+  const r=race(f,'stop','r.status=1;',{...input,apiKey:'',model:'failed-resume'});
+  assert.equal(r.status,1);assert.equal(fs.readFileSync(file,'utf8'),'configuring\n');assert.deepEqual(fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json')),beforeConfig);
+  const value=result(f.run('gui-configure',{...input,apiKey:''}));assert.equal(value.localError,'LOCAL_START_FAILED');assert.equal(fs.existsSync(file),false);
+}));
+
+test('interrupted configuring does not excuse changed instance identity',()=>fixture(f=>{
+  saved(f);fs.writeFileSync(path.join(f.target,'disabled'),'configuring\n');
+  const r=race(f,'stop',"const v=JSON.parse(fs.readFileSync(registry));v.instanceId='2'.repeat(32);save(registry,v);",{...input,apiKey:''});
+  assert.equal(r.status,1);assert.equal(fs.readFileSync(path.join(f.target,'disabled'),'utf8'),'configuring\n');assert.equal(fs.readFileSync(path.join(f.target,'start-called'),'utf8'),'start\n');
 }));
 
 test('published retired-directory flow still requires a fresh key and backs up data without executing it',()=>fixture(f=>{

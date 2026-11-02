@@ -567,7 +567,16 @@ function checkGuiRuntime(paths,previous=null,allowConfiguring=false,readOnly=fal
   // 仅接收原单模型格式，或 connection/Provider 完全对应的显式 ID 列表。
   const validated=validateConfig({endpoint,apiKey:provider.api_key,model,...(Object.hasOwn(connection,'models')?{models:connection.models}:{})},instance.port);
   const models=validated.models||[model];
-  if(endpoint!==provider.api_base_url||connection.baseUrl!==options.endpoint||typeof connection.apiKey!=='string'||!/^[0-9a-f]{48}$/.test(connection.apiKey)||validated.models&&!same(connection.models,validated.models)||!same(config,routerConfig(validated,instance.port,connection.apiKey)))throw guiError('RUNTIME_CONFLICT');
+  let canonical=same(config,routerConfig(validated,instance.port,connection.apiKey));
+  if(!canonical&&disabledText==='configuring\n'){
+    // SIGKILL 可发生在两次原子 rename 之间：仅精确事务标记下允许两份各自规范、同一本地密钥的配置。
+    // 不在 GET/ensure 中写回；下一次显式保存仍在锁内停止原实例、核对身份，再完整提交两份文件。
+    const route=config.Router?.default,interruptedModel=typeof route==='string'&&route.startsWith('relay,')?route.slice(6):'';
+    if(!interruptedModel||interruptedModel!==interruptedModel.trim()||interruptedModel.length>200||/[,\u0000-\u001f\u007f-\u009f]/u.test(interruptedModel))throw guiError('RUNTIME_CONFLICT');
+    const interrupted=validateConfig({endpoint,apiKey:provider.api_key,model:interruptedModel,models:provider.models},instance.port);
+    canonical=same(config,routerConfig(interrupted,instance.port,connection.apiKey));
+  }
+  if(endpoint!==provider.api_base_url||connection.baseUrl!==options.endpoint||typeof connection.apiKey!=='string'||!/^[0-9a-f]{48}$/.test(connection.apiKey)||validated.models&&!same(connection.models,validated.models)||!canonical)throw guiError('RUNTIME_CONFLICT');
   if(previous&&(previous.configText!==configText||previous.connectionText!==connectionText))throw guiError('RUNTIME_CONFLICT');
   // 在任何配置副作用前拒绝坏故障标记（FIFO/链接/硬链接/越界），原因只投影为固定码。
   const fault=path.join(instance.runtime.state,'recovery.failed');
@@ -645,13 +654,14 @@ async function guiConfigure(input){
           checkLock();if(registration.read(paths.home))throw guiError('RUNTIME_CONFLICT');
           atomic(registration.fileOf(paths.home),JSON.stringify(registration.value(target,port,service.instanceId),null,2)+'\n');
         }});
-    }else if(current.endpoint!==config.endpoint||current.model!==config.model||!same(current.models,config.models||[config.model])||current.explicitModels!==Object.hasOwn(config,'models')||current.apiKey!==config.apiKey){
+    }else if(current.disabledText==='configuring\n'||current.endpoint!==config.endpoint||current.model!==config.model||!same(current.models,config.models||[config.model])||current.explicitModels!==Object.hasOwn(config,'models')||current.apiKey!==config.apiKey){
       readSettings(paths.settings,true);
       const nextConfigText=JSON.stringify(routerConfig(config,current.instance.port,current.localKey),null,2)+'\n';
       const nextConnectionText=JSON.stringify(connectionConfig(config,current.options.endpoint,current.localKey),null,2)+'\n';
-      const disabledPath=path.join(paths.target,'disabled'),hadDisabled=current.componentDisabled;
+      const disabledPath=path.join(paths.target,'disabled'),hadDisabled=current.disabledText!==null&&current.disabledText!=='configuring\n';
+      const inheritedTemporary=current.disabledText==='configuring\n';
       const beforeDisable=()=>{const now=recheck(current);if(now.disabledText!==current.disabledText)throw guiError('RUNTIME_CONFLICT');};
-      beforeDisable();if(!hadDisabled)instanceAtomic(disabledPath,'configuring\n',beforeDisable);
+      beforeDisable();if(!hadDisabled&&!inheritedTemporary)instanceAtomic(disabledPath,'configuring\n',beforeDisable);
       const transactionRecheck=previous=>{
         checkLock();const now=checkGuiRuntime(paths,previous,true);
         if(now.disabledText!==(hadDisabled?current.disabledText:'configuring\n'))throw guiError('RUNTIME_CONFLICT');
@@ -664,6 +674,7 @@ async function guiConfigure(input){
           fs.unlinkSync(disabledPath);
         }
       };
+      // 只有精确 configuring 是未完成事务：显式保存可重做并在成功后清除；其他停用标记保留。
       // disabled 阻止本安装 Hook/看护重启；只停止已核对的同一服务实例。
       try{
         transactionRecheck(current);stopManaged(paths.target);
@@ -672,7 +683,9 @@ async function guiConfigure(input){
         atomic(current.configPath,nextConfigText);
         checkLock();checkInstance(paths.target,current.options,current.instance);
         atomic(current.connectionPath,nextConnectionText);
-        transactionRecheck(null);
+        // 允许读取崩溃残留不代表本次已提交；删标记前必须是本次精确、成对的目标文本。
+        const committed=transactionRecheck(null);
+        if(committed.configText!==nextConfigText||committed.connectionText!==nextConnectionText)throw guiError('RUNTIME_CONFLICT');
         clearTemporary();
       }catch(error){
         // 只回滚仍属于同一实例的本次写入；身份变化时保留 tombstone，绝不追着新实例写。
@@ -682,7 +695,7 @@ async function guiConfigure(input){
           const actualConfig=fs.readFileSync(current.configPath,'utf8'),actualConnection=fs.readFileSync(current.connectionPath,'utf8');
           if(![current.configText,nextConfigText].includes(actualConfig)||![current.connectionText,nextConnectionText].includes(actualConnection))throw guiError('RUNTIME_CONFLICT');
           atomic(current.configPath,current.configText);atomic(current.connectionPath,current.connectionText);
-          transactionRecheck(current);clearTemporary();
+          transactionRecheck(current);if(!inheritedTemporary)clearTemporary();
         }catch{}
         throw error;
       }

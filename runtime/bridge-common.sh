@@ -47,7 +47,7 @@ bridge_component_present() { bridge_component_state >/dev/null; }
 # 等待期间不修补、不停止/启动 CCR、不消费恢复预算；退出后绝不循环复活。
 bridge_component_confirm() {
   local stamp rc deadline
-  stamp=$(bridge_component_state); rc=$?
+  stamp=$(bridge_component_state "${1:-}"); rc=$?
   (( rc == 3 )) || return "$rc"
   bridge_log watchdog "固定组件入口暂缺，最多确认 10 秒；期间不重启"
   deadline=$((SECONDS + 10))
@@ -55,6 +55,7 @@ bridge_component_confirm() {
     [[ ! -e "$STATE/recovery.failed" && ! -L "$STATE/recovery.failed" ]] || return 1
     sleep 0.2
     bridge_component_state "$stamp" >/dev/null; rc=$?
+    [[ ! -e "$STATE/recovery.failed" && ! -L "$STATE/recovery.failed" ]] || return 1
     (( rc == 3 )) || return "$rc"
   done
   return 3
@@ -94,13 +95,29 @@ bridge_pid() {
   printf '%s\n' "$pid"
 }
 
+# 只作跨解锁窗口的实例比较；PID + 内核启动时刻避免 PID 复用被当成原来的桥。
+bridge_instance() {
+  local pid rest
+  local -a fields=()
+  pid=$(bridge_pid) || return 1
+  IFS= read -r rest < "/proc/$pid/stat" || return 1
+  rest=${rest##*) }
+  read -r -a fields <<< "$rest"
+  [[ ${fields[19]:-} =~ ^[0-9]+$ ]] || return 1
+  printf '%s:%s\n' "$pid" "${fields[19]}"
+}
+
 bridge_healthy() {
-  bridge_pid >/dev/null || return 1
-  # 常规失败仅写有界 health.log；日志失效最多报一次固定诊断，绝不吞掉或无限重复追加。
+  if ! bridge_pid >/dev/null; then
+    BRIDGE_HEALTH_LOG_HEALTHY_SINCE=-1
+    return 1
+  fi
+  # 日志失效每轮只报一次固定诊断；须连续成功探活 300 秒才允许下一轮报告。
+  # 任何失败（含 PID 消失）中断计时，不能靠故障持续时间或短暂成功反复刷屏。
+  local diagnostic rc code
   if (( ${BRIDGE_HEALTH_LOG_FAILED:-0} )); then
-    node "$BR/health.cjs" "$PORT" --log "$STATE/health.log" 2>/dev/null
+    node "$BR/health.cjs" "$PORT" --log "$STATE/health.log" 2>/dev/null; rc=$?
   else
-    local diagnostic rc code
     diagnostic=$(node "$BR/health.cjs" "$PORT" --log "$STATE/health.log" 2>&1); rc=$?
     if [[ -n "$diagnostic" ]]; then
       BRIDGE_HEALTH_LOG_FAILED=1
@@ -110,8 +127,17 @@ bridge_healthy() {
         fi
       done <<< "$diagnostic"
     fi
-    return "$rc"
   fi
+  if (( rc != 0 )); then
+    BRIDGE_HEALTH_LOG_HEALTHY_SINCE=-1
+  elif (( ${BRIDGE_HEALTH_LOG_FAILED:-0} )); then
+    (( ${BRIDGE_HEALTH_LOG_HEALTHY_SINCE:--1} >= 0 )) || BRIDGE_HEALTH_LOG_HEALTHY_SINCE=$SECONDS
+    if (( SECONDS - BRIDGE_HEALTH_LOG_HEALTHY_SINCE >= 300 )); then
+      BRIDGE_HEALTH_LOG_FAILED=0
+      BRIDGE_HEALTH_LOG_HEALTHY_SINCE=-1
+    fi
+  fi
+  return "$rc"
 }
 
 watchdog_running() {

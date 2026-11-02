@@ -41,8 +41,8 @@ const state=path.join(process.env.HOME,'.claude-code-router');
 fs.writeFileSync(path.join(state,'.claude-code-router.pid'),String(process.pid));
 fs.appendFileSync(path.join(state,'fake-starts'),'start\n');
 const server=http.createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({status:fs.existsSync(path.join(state,'fake-unhealthy'))?'not-ok':'ok'}));});
-server.listen(Number(process.env.SERVICE_PORT),'127.0.0.1');
-process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
+setTimeout(()=>server.listen(Number(process.env.SERVICE_PORT),'127.0.0.1'),Number(process.env.HOOK_TEST_LISTEN_DELAY||0));
+process.on('SIGTERM',()=>{fs.appendFileSync(path.join(state,'fake-stops'),String(process.pid)+'\n');const remove=path.join(state,'fake-remove-entry-on-stop');if(fs.existsSync(remove)){fs.unlinkSync(fs.readFileSync(remove,'utf8'));fs.unlinkSync(remove);}server.close(()=>process.exit(0));});
 `);
   fs.writeFileSync(path.join(dir,'patch-ccr.js'),String.raw`const fs=require('node:fs');fs.appendFileSync(__dirname+'/patch-runs','patch\n');setTimeout(()=>process.exit(0),Number(process.env.HOOK_TEST_PATCH_DELAY||0));`);
   const entry=path.join(dir,'component-source/component.cjs');
@@ -69,6 +69,7 @@ process.on('SIGTERM',()=>server.close(()=>process.exit(0)));
   return {dir,state,port,env,entry,cli,healthy,hook,alive,clean};
 }
 async function test(name,body){
+  if(process.env.HOOK_TEST_FILTER&&!new RegExp(process.env.HOOK_TEST_FILTER).test(name))return;
   const f=await fixture();
   try{await body(f);passed++;console.log('PASS hook '+passed+': '+name);}catch(error){for(const file of ['bridge.out','start.log']){const log=path.join(f.state,file);if(fs.existsSync(log))console.error(file+': '+fs.readFileSync(log,'utf8'));}throw error;}finally{await f.clean();}
 }
@@ -265,6 +266,184 @@ async function test(name,body){
     assert.equal((await f.hook()).status,0);await until(f.healthy,'manifest update initial ready');fs.unlinkSync(f.entry);await sleep(500);
     const file=path.join(f.dir,'.ccr-bridge-kit.json'),m=JSON.parse(fs.readFileSync(file));m.unexpected='replacement';fs.writeFileSync(file,JSON.stringify(m));fs.writeFileSync(f.entry,'// replacement entry');
     await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'replacement metadata rejected');assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),true);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+  });
+  async function patchGap(f,{running=false,patched=0,unhealthy=false}={}){
+    if(running){
+      assert.equal((await f.hook()).status,0);await until(f.healthy,'gap initial bridge ready');
+    }
+    fs.writeFileSync(path.join(f.dir,'patch-ccr.js'),`const fs=require('node:fs');fs.appendFileSync(__dirname+'/patch-runs','patch\\n');if(!fs.existsSync(__dirname+'/gap-entered')){fs.unlinkSync(${JSON.stringify(f.entry)});fs.writeFileSync(__dirname+'/gap-entered','ready');}process.exitCode=${patched};`);
+    if(running)fs.writeFileSync(path.join(f.state,unhealthy?'fake-unhealthy':'restart.request'),'fixture recovery\n');
+    assert.equal((await f.hook()).status,0);
+    await until(()=>fs.existsSync(path.join(f.dir,'gap-entered')),'gap patch removed component entry');
+    await until(()=>fs.existsSync(path.join(f.state,'bridge.out'))&&fs.readFileSync(path.join(f.state,'bridge.out'),'utf8').includes('最多确认 10 秒'),'gap confirmation began');
+    return {attempts:fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),pid:f.alive('.claude-code-router.pid',f.cli)};
+  }
+  const serviceProbe=f=>run('flock',['-n',path.join(f.state,'service.lock'),'true'],f.env);
+  await test('missing entry after patch releases service.lock and retries safely after restoration',async f=>{
+    const {attempts}=await patchGap(f);
+    assert.equal((await serviceProbe(f)).status,0,'read-only entry confirmation held service.lock');
+    assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+    fs.writeFileSync(f.entry,'// restored after unlocked confirmation');await until(f.healthy,'gap retry bridge ready');await sleep(400);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+    assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+  });
+  await test('missing entry after patch has one bounded ten-second confirmation and leaves its budget intact',async f=>{
+    const {attempts}=await patchGap(f),started=Date.now();
+    assert.equal((await serviceProbe(f)).status,0,'bounded confirmation still holds service.lock');
+    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'one bounded missing-entry confirmation',12500);
+    assert.ok(Date.now()-started<11500,'confirmation exceeded its ten-second budget');
+    const text=fs.readFileSync(path.join(f.state,'bridge.out'),'utf8');assert.equal((text.match(/最多确认 10 秒/g)||[]).length,1);
+    assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.failed'),'utf8'),'component removed or disabled\n');
+    fs.writeFileSync(f.entry,'// returned only after bounded confirmation expired');assert.equal((await f.hook()).status,0);await sleep(400);
+    assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+  });
+  for(const change of ['disabled','recovery.failed','manifest']){
+    await test('unlocked entry confirmation respects '+change+' without killing, spawning or clearing budget',async f=>{
+      const {attempts,pid}=await patchGap(f,{running:true});assert.ok(pid);
+      assert.equal((await serviceProbe(f)).status,0,'gap must not keep service.lock');
+      const fault=path.join(f.state,'recovery.failed');
+      if(change==='disabled')fs.writeFileSync(path.join(f.dir,'disabled'),'fixture disabled\n');
+      if(change==='recovery.failed')fs.writeFileSync(fault,'fixture authoritative failure\n');
+      if(change==='manifest'){
+        const file=path.join(f.dir,'.ccr-bridge-kit.json'),m=JSON.parse(fs.readFileSync(file));m.replaced='fixture';fs.writeFileSync(file,JSON.stringify(m));
+      }
+      fs.writeFileSync(f.entry,'// entry returned after concurrent state change');
+      await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'gap state change stops watchdog');
+      assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);assert.equal(await f.healthy(),true);
+      assert.equal(fs.existsSync(path.join(f.state,'fake-stops')),false);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+      assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+      if(change==='disabled')assert.equal(fs.existsSync(fault),false);
+      if(change==='recovery.failed')assert.equal(fs.readFileSync(fault,'utf8'),'fixture authoritative failure\n');
+      if(change==='manifest')assert.equal(fs.readFileSync(fault,'utf8'),'component removed or disabled\n');
+    });
+  }
+  await test('unlocked confirmation rechecks component identity after service.lock becomes available',async f=>{
+    const {attempts}=await patchGap(f);
+    const holder=spawn('bash',['-c',String.raw`exec 9> "$1/runtime-home/.claude-code-router/service.lock"; flock -n 9 || exit 21; printf held > "$1/reacquire-held"; while [[ ! -e "$1/reacquire-release" ]]; do sleep 0.05; done; node -e 'const fs=require("node:fs"),file=process.argv[1]+"/.ccr-bridge-kit.json",m=JSON.parse(fs.readFileSync(file));m.changedAfterConfirmation=true;fs.writeFileSync(file,JSON.stringify(m));' "$1"; flock -u 9`,'fixture',f.dir],{env:f.env,stdio:'ignore'});
+    try{
+      await until(()=>fs.existsSync(path.join(f.dir,'reacquire-held'))||holder.exitCode!==null,'concurrent lock holder ready');
+      assert.equal(holder.exitCode,null,'confirmation did not release service.lock');
+      fs.writeFileSync(f.entry,'// returned while another ensure holds lock');await sleep(600);
+      assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+      fs.writeFileSync(path.join(f.dir,'reacquire-release'),'release');
+      await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'changed identity rejected after lock release');
+      assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+      assert.equal(fs.readFileSync(path.join(f.state,'recovery.failed'),'utf8'),'component removed or disabled\n');
+    }finally{holder.kill('SIGTERM');if(holder.exitCode===null&&holder.signalCode===null)await new Promise(resolve=>holder.once('close',resolve));}
+  });
+  await test('another ensure starting during unlocked confirmation is not stopped or duplicated',async f=>{
+    const {attempts}=await patchGap(f);
+    const ensured=await run('bash',['-c',String.raw`exec 9> "$1/runtime-home/.claude-code-router/service.lock"; flock -n 9 || exit 21; setsid node "$1/node_modules/@musistudio/claude-code-router/dist/cli.js" start < /dev/null > /dev/null 2>&1 9>&- &`,'fixture',f.dir],{...f.env,HOME:path.join(f.dir,'runtime-home'),SERVICE_PORT:String(f.port)});
+    assert.equal(ensured.status,0,'another ensure could not acquire service.lock: '+ensured.stderr);await until(f.healthy,'other ensure bridge ready');
+    const pid=f.alive('.claude-code-router.pid',f.cli);fs.writeFileSync(f.entry,'// entry returned after another ensure');await sleep(900);
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+    assert.equal(fs.existsSync(path.join(f.state,'fake-stops')),false);assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+  });
+  await test('another ensure slow startup during unlocked confirmation is neither killed nor duplicated',async f=>{
+    const {attempts}=await patchGap(f);
+    const ensured=await run('bash',['-c',String.raw`exec 9> "$1/runtime-home/.claude-code-router/service.lock"; flock -n 9 || exit 21; setsid node "$1/node_modules/@musistudio/claude-code-router/dist/cli.js" start < /dev/null > /dev/null 2>&1 9>&- &`,'fixture',f.dir],{...f.env,HOME:path.join(f.dir,'runtime-home'),SERVICE_PORT:String(f.port),HOOK_TEST_LISTEN_DELAY:'1800'});
+    assert.equal(ensured.status,0,ensured.stderr);await until(()=>f.alive('.claude-code-router.pid',f.cli),'other ensure slow bridge PID');
+    const pid=f.alive('.claude-code-router.pid',f.cli);assert.equal(await f.healthy(),false);fs.writeFileSync(f.entry,'// entry returned before slow ensure is healthy');
+    await until(f.healthy,'other ensure slow bridge finishes startup');await sleep(400);
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+    assert.equal(fs.existsSync(path.join(f.state,'fake-stops')),false);assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+  });
+  await test('another ensure startup protection stays bounded and persistent failures recover normally',async f=>{
+    const {attempts}=await patchGap(f);
+    const ensured=await run('bash',['-c',String.raw`source "$1/bridge-common.sh" || exit; exec 9> "$STATE/service.lock"; flock -n 9 || exit 21; setsid node "$CLI" start < /dev/null > /dev/null 2>&1 9>&- &`,'fixture',f.dir],{...f.env,HOOK_TEST_LISTEN_DELAY:'30000'});
+    assert.equal(ensured.status,0,ensured.stderr);await until(()=>f.alive('.claude-code-router.pid',f.cli),'never-ready ensure bridge PID');
+    const pid=f.alive('.claude-code-router.pid',f.cli),restored=Date.now();fs.writeFileSync(f.entry,'// entry returned but foreign startup never becomes healthy');
+    await sleep(900);assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);assert.equal(fs.existsSync(path.join(f.state,'fake-stops')),false);
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+    await until(f.healthy,'persistent other ensure startup recovers after bounded grace',10000);
+    assert.ok(Date.now()-restored<9500,'ensure startup protection became unbounded');assert.notEqual(f.alive('.claude-code-router.pid',f.cli),pid);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\nstart\n');assert.equal(fs.readFileSync(path.join(f.state,'fake-stops'),'utf8'),pid+'\n');
+    assert.equal(Number(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8')),Number(attempts)+1);assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+  });
+  await test('entry confirmation before taking service.lock also preserves another ensure slow startup',async f=>{
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'prelock gap initial ready');
+    const pid=f.alive('.claude-code-router.pid',f.cli),attempts=fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8');fs.unlinkSync(f.entry);
+    await until(()=>fs.readFileSync(path.join(f.state,'bridge.out'),'utf8').includes('最多确认 10 秒'),'prelock gap confirmation began');
+    const ensured=await run('bash',['-c',String.raw`source "$1/bridge-common.sh" || exit; exec 9> "$STATE/service.lock"; flock -n 9 || exit 21; bridge_stop "$2" || exit 22; setsid node "$CLI" start < /dev/null > /dev/null 2>&1 9>&- &`,'fixture',f.dir,String(pid)],{...f.env,HOOK_TEST_LISTEN_DELAY:'1800'});
+    assert.equal(ensured.status,0,ensured.stderr);await until(()=>f.alive('.claude-code-router.pid',f.cli),'prelock other ensure PID');
+    const replacement=f.alive('.claude-code-router.pid',f.cli);fs.writeFileSync(f.entry,'// returned after prelock replacement');
+    await until(f.healthy,'prelock other ensure slow startup complete');await sleep(400);
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),replacement);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\nstart\n');
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-stops'),'utf8'),pid+'\n');assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+  });
+  await test('entry confirmation after stop abandons the pending spawn when another ensure starts slowly',async f=>{
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'post-stop gap initial ready');
+    const pid=f.alive('.claude-code-router.pid',f.cli);fs.writeFileSync(path.join(f.state,'fake-remove-entry-on-stop'),f.entry);fs.writeFileSync(path.join(f.state,'fake-unhealthy'),'fixture recovery');
+    await until(()=>fs.readFileSync(path.join(f.state,'bridge.out'),'utf8').includes('最多确认 10 秒'),'post-stop gap confirmation began');
+    const attempts=fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8');fs.rmSync(path.join(f.state,'fake-unhealthy'));
+    const ensured=await run('bash',['-c',String.raw`source "$1/bridge-common.sh" || exit; exec 9> "$STATE/service.lock"; flock -n 9 || exit 21; setsid node "$CLI" start < /dev/null > /dev/null 2>&1 9>&- &`,'fixture',f.dir],{...f.env,HOOK_TEST_LISTEN_DELAY:'1800'});
+    assert.equal(ensured.status,0,ensured.stderr);await until(()=>f.alive('.claude-code-router.pid',f.cli),'post-stop other ensure PID');
+    const replacement=f.alive('.claude-code-router.pid',f.cli);fs.writeFileSync(f.entry,'// returned after pending spawn was abandoned');
+    await until(f.healthy,'post-stop other ensure slow startup complete');await sleep(400);
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),replacement);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\nstart\n');
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-stops'),'utf8'),pid+'\n');assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+  });
+  await test('another ensure replacing an unhealthy bridge clears no durable recovery budget',async f=>{
+    const {pid}=await patchGap(f,{running:true,unhealthy:true});
+    const ensured=await run('bash',['-c',String.raw`source "$1/bridge-common.sh" || exit; exec 9> "$STATE/service.lock"; flock -n 9 || exit 21; bridge_stop "$2" || exit 22; printf '3\n' > "$STATE/recovery.attempts"; rm -f -- "$STATE/restart.request" "$STATE/fake-unhealthy"; setsid node "$CLI" start < /dev/null > /dev/null 2>&1 9>&- &`,'fixture',f.dir,String(pid)],f.env);
+    assert.equal(ensured.status,0,'another ensure could not safely replace the fixture bridge: '+ensured.stderr);await until(f.healthy,'other ensure replacement ready');
+    const replacement=f.alive('.claude-code-router.pid',f.cli);assert.notEqual(replacement,pid);fs.writeFileSync(f.entry,'// entry returned after replacement');await sleep(900);
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),replacement);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\nstart\n');
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-stops'),'utf8'),pid+'\n');
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),'3\n');assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+  });
+  await test('unlocked confirmation retains patch exit 2 restart intent',async f=>{
+    const {pid}=await patchGap(f,{running:true,patched:2,unhealthy:true});assert.ok(pid);
+    fs.writeFileSync(path.join(f.dir,'patch-ccr.js'),"const fs=require('node:fs');fs.appendFileSync(__dirname+'/patch-runs','patch\\n');process.exitCode=0;");
+    fs.rmSync(path.join(f.state,'fake-unhealthy'));fs.writeFileSync(f.entry,'// entry returned after changed patch');
+    await until(()=>fs.readFileSync(path.join(f.state,'fake-starts'),'utf8')==='start\nstart\n','changed patch restarts once');await until(f.healthy,'changed patch restart ready');await sleep(400);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-stops'),'utf8'),pid+'\n');assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+  });
+  await test('entry confirmation does not count unobserved time as stable health or clear budget',async f=>{
+    assert.equal((await f.hook({CCR_BRIDGE_RECOVERY_STABLE:'3'})).status,0);await until(f.healthy,'stable-gap initial ready');
+    await sleep(500);const attempts=fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8');fs.unlinkSync(f.entry);
+    await until(()=>fs.readFileSync(path.join(f.state,'bridge.out'),'utf8').includes('最多确认 10 秒'),'stable-gap confirmation began');
+    await sleep(3300);fs.writeFileSync(f.entry,'// health must be observed again');await sleep(600);
+    assert.equal(fs.existsSync(path.join(f.state,'recovery.attempts')),true,'entry wait was incorrectly credited as sustained health');
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts,'entry wait was incorrectly credited as sustained health');
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+  });
+  await test('health log diagnostics rearm only after sustained successful probes and never after failures',async f=>{
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'health reset initial ready');
+    const watch=f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh'));process.kill(watch,'SIGTERM');await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'health reset watchdog stopped');
+    fs.mkdirSync(path.join(f.state,'health.log'));
+    const r=await run('bash',['-c',String.raw`source "$1/bridge-common.sh" || exit
+probe() { bridge_healthy; local rc=$?; printf '%s:%s\n' "$1" "$rc"; [[ "$rc" = "$2" ]] || exit 90; }
+printf bad > "$STATE/fake-unhealthy"
+probe first 1; printf 'mark:first\n' >&2
+for i in {1..8}; do probe repeat 1; done
+SECONDS=$((SECONDS+600)); probe long_failure 1; printf 'mark:failure\n' >&2
+rm -f -- "$STATE/fake-unhealthy"; SECONDS=1000; probe healthy_start 0
+SECONDS=1298; probe short_health 0
+printf bad > "$STATE/fake-unhealthy"; probe short_failure 1; printf 'mark:short\n' >&2
+rm -f -- "$STATE/fake-unhealthy"; SECONDS=2000; probe restarted_health 0
+SECONDS=2298; probe still_short 0
+saved_pid=$(< "$PIDFILE"); rm -f -- "$PIDFILE"; SECONDS=2301; probe missing_pid 1
+printf '%s\n' "$saved_pid" > "$PIDFILE"; SECONDS=3000; probe after_missing_pid 0
+SECONDS=3298; probe before_stable 0
+printf bad > "$STATE/fake-unhealthy"; probe interrupted 1; printf 'mark:interrupted\n' >&2
+rm -f -- "$STATE/fake-unhealthy"; SECONDS=4000; probe final_health_start 0
+SECONDS=4302; probe stable_health 0
+printf bad > "$STATE/fake-unhealthy"; probe rearmed 1; printf 'mark:rearmed\n' >&2
+for i in {1..8}; do probe final_repeat 1; done
+printf 'mark:end\n' >&2`,'fixture',f.dir],f.env,15000);
+    assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/rearmed:1/);
+    const marks=r.stderr.split(/mark:[^\n]+\n/);assert.equal(marks.length,7,r.stderr);
+    for(const index of [0,4]){
+      const lines=marks[index].trim().split('\n');assert.equal(lines.length,2,r.stderr);
+      assert.match(lines[0],/^\[[0-9TZ:.+-]+\] health HEALTH_STATUS$/);assert.match(lines[1],/^\[[0-9TZ:.+-]+\] health LOG_UNSAFE_FILE$/);
+    }
+    for(const index of [1,2,3,5,6])assert.equal(marks[index],'','brief health or repeated failure rearmed stderr: '+r.stderr);
+    assert.equal(fs.lstatSync(path.join(f.state,'health.log')).isDirectory(),true);
   });
   await test('real common health probe logs only safe bounded timestamped failures and leaves success quiet',async f=>{
     assert.equal((await f.hook()).status,0);await until(f.healthy,'health-log initial ready');

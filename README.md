@@ -69,9 +69,9 @@ openai-bridge uninstall --yes
 
 **支持 v1 契约的配套 App** 会在组件管理器卸载时先取消在途启动，把注册端点/实例传给固定卸载入口核对，再停用本实例、移除自身 Hook/注册，最后删除组件文件；合法实例停用失败则保留组件供排错。坏注册、未知 schema 或不健康安装记录不能卡住卸载：App 不执行其中提供的路径，只清固定残留注册并继续原有受管文件清理；不能从损坏数据验证进程身份时不承诺已停服，也不猜测删除私有目录。默认保留私有配置，卸载中不能取消。**旧 App 仍须先运行上述 uninstall**：旧版仅删除包文件，不会主动清理 Hook 或停止已有 CCR。残留 Hook/看护发现入口消失后不再启动新 CCR；若包已移除，可在私有安装目录执行 `bash uninstall.sh --yes` 清理。组件更新后，`ensure` 或 GUI 保存会在实例/注册/原文件核对通过后安全停止并原子升级本组件受管运行文件；只读状态/清单不执行旧脚本。此路径不接管外来/手工实例、不读取卸载备份里的旧 Key，也不自动清恢复故障锁。
 
-GUI 的 `localReady` 同时受 `target/disabled` 和 `target/runtime-home/.claude-code-router/recovery.failed` 阻断，不能凭残留健康 HTTP/PID 判断可用。状态和保存保留 `RECOVERY_EXHAUSTED`、`PATCH_VERIFICATION_FAILED`、`COMPONENT_DISABLED` 或 `LOCAL_START_FAILED`；连续保存不会清除故障锁/恢复次数，也不会自动 reset。排查后仍只能由用户显式执行原有 `start --reset-recovery --yes`，没有 GUI 重置按钮。
+GUI 的 `localReady` 同时受 `target/disabled` 和 `target/runtime-home/.claude-code-router/recovery.failed` 阻断，不能凭残留健康 HTTP/PID 判断可用。状态和保存保留 `RECOVERY_EXHAUSTED`、`PATCH_VERIFICATION_FAILED`、`COMPONENT_DISABLED` 或 `LOCAL_START_FAILED`；连续保存不会清除故障锁/恢复次数，也不会自动 reset。排查后仍只能由用户显式执行原有 `start --reset-recovery --yes`，没有 GUI 重置按钮。唯一例外是崩溃遗留、内容精确为 `configuring\n` 的配置事务标记：状态查询仍只读阻断，下一次明确保存会在锁内核对身份、停止原实例、完整提交配置后清掉这个临时标记；同内容保存也可完成。其他停用标记和任何恢复故障/次数不清；续配失败保留继承的临时标记供下一次明确保存处理。
 
-市场更新短时移除固定 `component.cjs` 时，已有看护只对入口 `ENOENT` 最多确认 **10 秒**：原 manifest 身份须不变，恢复成规范普通文件才继续，等待期间不 patch/kill/spawn。明确 disabled 立即退出，不制造新故障锁；超时仍锁停，不无限等候或复活真卸载。该修复针对已用假服务复现的更新瞬态误判；现场下午停桥日志命中入口不可用分支，但不能据此认定唯一诱因，更不认定是此前首次午夜探活失败的根因。健康失败码带 ISO 时间；看护将其安全有界写入私有 `STATE/health.log`（当前及一份 `.1` 各最多 64 KiB），写入成功不重复输出；日志本身失效时每个启动/看护进程最多报告一次固定诊断，不静默丢弃或无界重复追加。不会把响应正文、请求头、对话或密钥写入探活诊断。
+市场更新短时移除固定 `component.cjs` 时，已有看护只对入口 `ENOENT` 最多确认 **10 秒**：原 manifest 身份须不变，恢复成规范普通文件才继续，等待期间不 patch/kill/spawn，并释放 `service.lock`、放弃旧事务；返回主循环后非阻塞重取锁，重新核对 manifest、PID/启动时刻与持久预算，别的启动产生的新进程只获得有界就绪宽限。明确 disabled 立即退出，不制造新故障锁；超时仍锁停，不无限等候或复活真卸载。该修复针对已用假服务复现的更新瞬态误判；现场下午停桥日志命中入口不可用分支，但不能据此认定唯一诱因，更不认定是此前首次午夜探活失败的根因。健康失败码带 ISO 时间；看护将其安全有界写入私有 `STATE/health.log`（当前及一份 `.1` 各最多 64 KiB），写入成功不重复输出；日志本身失效时每轮故障最多报告一次固定诊断，只有连续成功探活 300 秒后才重新允许下一轮报告；任何探活失败、PID 消失或入口确认等待都中断计时，不静默丢弃或无界重复追加。不会把响应正文、请求头、对话或密钥写入探活诊断。
 
 HOME 仅在信任根处 realpath 规范，再构造默认目录并传给子进程；显式 `--dir` 及 HOME 下的路径链接核对不放宽。
 
@@ -111,7 +111,7 @@ node tests/audit-bundle.cjs
 
 ## 向组件市场同步
 
-先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（正式市场基线为 1.0.5-r14，本次配套候选为 1.0.5-r15，尚未正式发布）。配方文案的最终版本以市场仓库 `greyoak111/cccodroid-components` 为准，本仓库 `recipe/` 与其保持一致，避免下次同步覆盖。
+先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（正式市场基线为 1.0.5-r14，本次审查后配套候选为 1.0.5-r16，r15/r16 尚未正式发布）。配方文案的最终版本以市场仓库 `greyoak111/cccodroid-components` 为准，本仓库 `recipe/` 与其保持一致，避免下次同步覆盖。
 
 ## 许可与贡献
 
