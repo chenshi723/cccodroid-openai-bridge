@@ -74,6 +74,23 @@ test('router config uses fresh local key and never mutates input',()=>{
   assert.equal(out.LOG_LEVEL,'info');
   assert.equal(out.Router.default,'relay,model-test');
 });
+test('optional model IDs preserve the legacy shape and configure every model without changing default routes',()=>{
+  assert.deepEqual(api.validateConfig(valid,3459),valid);
+  const input={...valid,models:['model-two',valid.model,'模型-三']},before=structuredClone(input);
+  const normalized=api.validateConfig(input,3459),out=api.routerConfig(normalized,3459,'local-test-only');
+  assert.deepEqual(normalized,input);assert.deepEqual(out.Providers[0].models,input.models);
+  assert.deepEqual(api.routerConfig(valid,3459,'local-test-only').Providers[0].models,[valid.model]);
+  for(const name of ['default','background','think','longContext','webSearch'])assert.equal(out.Router[name],'relay,'+valid.model);
+  out.Providers[0].models.push('cannot-mutate-input');assert.deepEqual(input,before);
+  const hundred=Array.from({length:100},(_,i)=>'fixture-'+i);
+  assert.equal(api.validateConfig({...valid,model:hundred[99],models:hundred},3459).models.length,100);
+  assert.deepEqual(api.validateConfig({...valid,models:[' '+valid.model+' ',' model-two ']},3459).models,[valid.model,'model-two']);
+});
+test('models must contain 1..100 unique valid ID strings and include the default model',()=>{
+  for(const models of [undefined,null,{},'model-test',[],[valid.model,valid.model],[valid.model,' '+valid.model+' '],['other-model'],
+    ...[null,1,true,{},[],{id:'model-two'},'', ' ', 'bad,model','bad\nmodel','bad\tmodel','bad\u0085model','x'.repeat(201)].map(id=>[valid.model,id]),
+    Array.from({length:101},(_,i)=>i?'fixture-'+i:valid.model)])assert.throws(()=>api.validateConfig({...valid,models},3459));
+});
 test('settings with invalid JSON, wrong schema or all hooks disabled are rejected',()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kit-unit-'));
   const file=path.join(dir,'settings.json');

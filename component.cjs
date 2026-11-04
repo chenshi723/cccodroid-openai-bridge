@@ -2,16 +2,17 @@
 'use strict';
 const fs=require('node:fs');
 const path=require('node:path');
-const os=require('node:os');
 const {spawnSync}=require('node:child_process');
 const api=require('./installer.cjs');
 const [command='help',...args]=process.argv.slice(2);
 function run(file,argv){
-  const result=spawnSync(process.execPath,[file,...argv],{stdio:'inherit'});
+  const result=spawnSync(process.execPath,[file,...argv],{stdio:'inherit',env:{...process.env,HOME:api.trustedHome()}});
   if(result.error)throw result.error;
   process.exitCode=result.status??1;
 }
 try{
+  // 仅 HOME 信任根允许 realpath（应用 HOME 可是 Android 路径别名）；显式 --dir 不规范化。
+  const home=api.trustedHome();process.env.HOME=home;
   if(command==='--selftest'){
     if(args.length)throw new Error('selftest 不接受额外参数。');
     run(path.join(__dirname,'runtime/selftest.cjs'),[]);
@@ -28,13 +29,13 @@ try{
     if(command==='configure'){
       run(path.join(__dirname,'installer.cjs'),['install',...args,'--bundled-runtime',__dirname]);
     }else if(command==='ensure'||(command==='uninstall'&&scoped)){
-      const target=path.resolve(options.dir||path.join(os.homedir(),'.local/share/ccr-bridge-kit'));
+      const target=options.dir===undefined?path.join(home,'.local/share/ccr-bridge-kit'):path.resolve(options.dir);
       // 固定入口必须保留实例核对，不能将新参数交给可能不认识它们的旧 manage.cjs。
       // 当前安装器验证既有 manifest/注册/运行文件后管理它；绝不覆盖私有运行副本。
       const forwarded=options.dir===undefined?[...args,'--dir',target]:args;
       run(path.join(__dirname,'installer.cjs'),[command,...forwarded]);
     }else{
-      const target=path.resolve(options.dir||path.join(os.homedir(),'.local/share/ccr-bridge-kit'));
+      const target=options.dir===undefined?path.join(home,'.local/share/ccr-bridge-kit'):path.resolve(options.dir);
       const marker=path.join(target,'.ccr-bridge-kit.json');
       if(!fs.existsSync(marker))throw new Error('尚未配置此安装。请用户在终端运行 openai-bridge configure。');
       const manifest=JSON.parse(fs.readFileSync(marker,'utf8'));

@@ -208,6 +208,8 @@ async function appChild(){
     await error({...input(),model:'not-part-of-discovery'},'consent_required',{component:false});
     const missing=await error({endpoint:input().endpoint,consent:true},'KEY_REQUIRED');assert.equal(missing.value.field,'apiKey');
     await success('v1',['fixture-model-a','fixture-model-b']);
+    const windows=await request(input('windows'));assert.equal(windows.status,200);
+    assert.deepEqual(windows.value,{ok:true,models:[{id:'fixture-window',context_window:1048576},{id:'fixture-output-only'},{id:'fixture-invalid-window'}],truncated:false});
     await success('tenant%2Fproject/v2',['fixture-prefix']);
     await success('empty',[]);
     await success('count',Array.from({length:500},(_,i)=>'fixture-model-'+i),true);
@@ -273,6 +275,7 @@ async function main(){
         if(req.url==='/invalid/models'){res.writeHead(200,headers);res.end(upstreamPrivate+' {invalid JSON');return;}
         let body;
         if(req.url==='/v1/models')body=JSON.stringify({data:[{id:'fixture-model-a',owned_by:upstreamPrivate,apiKey:fakeKey},{id:'fixture-model-b'},{id:'fixture-model-a'},{id:'bad,model'},{},null],apiKey:fakeKey,next:'https://localhost:'+sentinel.address().port+'/sentinel/models'});
+        else if(req.url==='/windows/models')body=JSON.stringify({data:[{id:'fixture-window',context_length:1048576,max_tokens:8192,private:upstreamPrivate},{id:'fixture-output-only',max_tokens:32768},{id:'fixture-invalid-window',context_window:512}]});
         else if(req.url==='/tenant%2Fproject/v2/models')body=JSON.stringify({data:[{id:'fixture-prefix'}]});
         else if(req.url==='/empty/models')body='{"data":[]}';
         else if(req.url==='/count/models')body=JSON.stringify({data:Array.from({length:501},(_,i)=>({id:'fixture-model-'+i}))});
@@ -296,7 +299,7 @@ async function main(){
     assert.equal(received.length,new Set(received.map(r=>r.url)).size,'there must be no retry, duplicate preflight, pagination or inference request');
     if(result.status!==0)process.stderr.write(clean(result.err+result.out));
     assert(!result.timedOut&&!result.excess&&result.status===0,'real App/component models integration failed; disposable fixture will be removed');
-    const expected=['/v1/models','/tenant%2Fproject/v2/models','/empty/models','/count/models','/bytes/models','/exact/models','/large/models','/large-chunked/models','/invalid/models',
+    const expected=['/v1/models','/windows/models','/tenant%2Fproject/v2/models','/empty/models','/count/models','/bytes/models','/exact/models','/large/models','/large-chunked/models','/invalid/models',
       ...[401,403,404,429].map(s=>'/status-'+s+'/models'),...[301,302,303,307,308].map(s=>'/redirect-'+s+'/models'),'/redirect-same/models','/slow/models'];
     assert.deepEqual(received.map(r=>r.url),expected,'only requested model-list URLs are contacted, once each');
     process.stdout.write(result.out);console.log(JSON.stringify({ok:true,caProvisioning,archiveStage:stage?{path:stage,payloadsMatchRepository:true,payloads:stagePayloads}:null,trustedUpstreamHttpRequests:received.length,

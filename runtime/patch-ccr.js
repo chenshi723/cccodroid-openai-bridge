@@ -367,6 +367,99 @@ const IMAGE_TOKENS_NEW = `          } else if (contentPart.type === "image") {
             } else tokenCount += enc.encode(typeof contentPart.content === "string" ? contentPart.content : JSON.stringify(contentPart.content)).length;
           }`;
 
+// 11) 有的上游不认 reasoning_effort / reasoning（见 1），只回一句笼统的 400 Invalid request payload，
+//     Claude Code 认不出这是「不支持 effort」，不会自己降级重试，整轮失败（cccodroid #84）。
+//     带了这两个字段、拿到的 400 又像「请求参数不对」时，去掉它们重发一次；成功就记住这个地址+模型（进程内，桥重启即清），之后直接不带。
+//     重发也失败、或重发本身断网/超时，都把第一次的错误原样交回去，不掩盖真正的原因。
+//     误判面：400 正文像参数错误、但真实原因是别的，而去掉推理参数后又恰好成功——这时该模型在本进程内不再带推理强度。
+const REASON_OLD = `, fetch(typeof r == "string" ? r : r.toString(), c);
+}`;
+const REASON_NEW = `, (() => {
+    // ccr-reasoning-fallback-v1
+    let url = typeof r == "string" ? r : r.toString(), key = url + "\\n" + (e && e.model), no = globalThis.__ccrNoReasoning || (globalThis.__ccrNoReasoning = new Set());
+    if (!e || (e.reasoning === undefined && e.reasoning_effort === undefined)) return fetch(url, c);
+    let strip = () => { let b = { ...e }; delete b.reasoning; delete b.reasoning_effort; return { ...c, body: JSON.stringify(b) }; };
+    if (no.has(key)) return fetch(url, strip());
+    return fetch(url, c).then((res) => res.status !== 400 ? res : res.text().then((txt) => {
+      let first = () => new Response(txt, { status: res.status, statusText: res.statusText, headers: res.headers });
+      if (!/invalid_request|invalid|unrecogni[sz]ed|unknown|unsupported|not (?:permitted|allowed|supported)|extra|reasoning|payload|parameter/i.test(txt)) return first();
+      return fetch(url, strip()).then((r2) => {
+        if (r2.ok) { no.add(key); try { n?.warn?.({ reqId: o?.req?.id, model: e.model }, "upstream rejected reasoning params; resent without them"); } catch {} return r2; }
+        try { r2.body?.cancel(); } catch {}
+        return first();
+      }, first);
+    }));
+  })();
+}`;
+
+// 12) CCR 1.0.73 仅识别 provider,model，普通 ID 会被 think/longContext/default 覆盖。
+//     本组件明确登记的 relay ID 优先；未知 ID 和旧 Claude 别名仍走原路由。
+const MODEL_ROUTE_OLD = `  const Router = projectSpecificRouter || config.Router;
+  if (req.body.model.includes(",")) {`;
+const MODEL_ROUTE_NEW = `  const Router = projectSpecificRouter || config.Router;
+  // ccr-relay-model-route-v1: preserve an explicitly configured model ID
+  const bridgeProvider = config.Providers?.find((p) => p.name === "relay");
+  if (typeof req.body.model === "string" && bridgeProvider?.models?.includes(req.body.model)) {
+    return "relay," + req.body.model;
+  }
+  if (req.body.model.includes(",")) {`;
+
+// 14) Gemini 3 的 OpenAI 兼容接口要求把工具调用的 thought signature 原样带回，缺了就 400
+//     （cccodroid #91）。签名在 tool_calls[].extra_content.google.thought_signature；
+//     Claude Code 的历史里没有这个字段，桥按 tool_call id 记在进程内（有界，桥重启即清）。
+//     回填只给同一上游模型；目标是 Gemini 但拿不到签名（桥重启过、换过模型）时，
+//     按 Google 文档给该步第一个调用填 skip_thought_signature_validator，不再整轮 400。
+//     假设：本组件只注册一个 relay 上游，模型名即上游身份；将来若多上游同名，需改按 (provider, model) 记。
+//     缺 index 的分片按 CCR 原有累积规则归到 0 号调用，签名与参数同一规则。
+const SIG_MARK = "// ccr-thought-signature-v1";
+const SIG_EDITS = [
+  [`    let bad = (message) => nt("Provider error: " + message, e.ok ? 502 : e.status, "provider_error");`,
+   `    let bad = (message) => nt("Provider error: " + message, e.ok ? 502 : e.status, "provider_error");
+    // ccr-thought-signature-v1: remember tool-call signatures by id
+    let remember = (id, signature) => {
+      if (typeof id !== "string" || !id || typeof signature !== "string" || !signature || signature.length > 65536) return;
+      let sigs = globalThis.__ccrThoughtSigs || (globalThis.__ccrThoughtSigs = new Map());
+      sigs.delete(id);
+      sigs.set(id, { model: t?.req?.__ccrUpstreamModel, signature });
+      while (sigs.size > 1024) sigs.delete(sigs.keys().next().value);
+    };`],
+  [`                    tool.arguments += part.function.arguments || "";`,
+   `                    tool.arguments += part.function.arguments || "";
+                    if (typeof part.extra_content?.google?.thought_signature === "string") tool.signature = part.extra_content.google.thought_signature;`],
+  [`                    validateEnd();
+                    finished = true;`,
+   `                    validateEnd();
+                    for (let tool of tools.values()) remember(tool.id, tool.signature);
+                    finished = true;`],
+  [`      check(value, false);
+      let message = this.convertOpenAIResponseToAnthropic(value, t);`,
+   `      check(value, false);
+      for (let tool of value.choices[0].message.tool_calls || []) remember(tool.id, tool.extra_content?.google?.thought_signature);
+      let message = this.convertOpenAIResponseToAnthropic(value, t);`],
+  [`  let u, f = AbortSignal.timeout(t.TIMEOUT ?? 60 * 1e3 * 60);`,
+   `  // ccr-thought-signature-v1: return remembered signatures to the same upstream model
+  e = ((body) => {
+    let model = body?.model, gemini = typeof model == "string" && /gemini/i.test(model), sigs = globalThis.__ccrThoughtSigs;
+    if (o?.req) o.req.__ccrUpstreamModel = model;
+    if (!body || !Array.isArray(body.messages) || !gemini && !sigs?.size) return body;
+    let has = (call) => typeof call?.extra_content?.google?.thought_signature === "string";
+    let sign = (call, signature) => ({ ...call, extra_content: { ...call.extra_content, google: { ...call.extra_content?.google, thought_signature: signature } } });
+    let changed = false, messages = body.messages.map((m) => {
+      if (m?.role !== "assistant" || !Array.isArray(m.tool_calls) || !m.tool_calls.length) return m;
+      let calls = m.tool_calls.map((call) => {
+        let saved = !has(call) && typeof call?.id === "string" && sigs?.get(call.id);
+        return saved && saved.model === model ? sign(call, saved.signature) : call;
+      });
+      if (gemini && !calls.some(has) && calls[0] !== null && typeof calls[0] === "object") calls[0] = sign(calls[0], "skip_thought_signature_validator");
+      if (calls.every((call, i) => call === m.tool_calls[i])) return m;
+      changed = true;
+      return { ...m, tool_calls: calls };
+    });
+    return changed ? { ...body, messages } : body;
+  })(e);
+  let u, f = AbortSignal.timeout(t.TIMEOUT ?? 60 * 1e3 * 60);`]
+];
+
 let src = fs.readFileSync(file, "utf8");
 let changed = false, missing = [];
 
@@ -385,12 +478,25 @@ patch("upstream cancel", '(e._ccrReader || e).cancel(o)', CANCEL_OLD, CANCEL_NEW
 patch("error handler", 't.raw.headersSent || t.raw.writableEnded', H_OLD, H_NEW);
 patch("request body log", 'n.log.debug({ data: n.body, type: "request body" })', BODY_OLD, BODY_NEW);
 patch("fresh connection", 'keepAliveMaxTimeout: 1', AGENT_OLD, AGENT_NEW);
+// 锚点只有两行：CCR 升级后若别处也出现同样片段，replace 会打错位置，宁可报缺也不乱打
+if (!src.includes("// ccr-reasoning-fallback-v1") && src.split(REASON_OLD).length > 2) missing.push("reasoning fallback (anchor not unique)");
+else patch("reasoning fallback", "// ccr-reasoning-fallback-v1", REASON_OLD, REASON_NEW);
 patch("explicit stream", 'stream: e.stream === true, tools:', STREAM_OLD, STREAM_NEW);
 patch("JSON/SSE response", SSE_MARK, src.includes(SSE_FALLBACK) ? SSE_FALLBACK : SSE_OLD, SSE_NEW);
 patch("tool result images", "// ccr-tool-images-v1:", TOOL_IMAGES_OLD, TOOL_IMAGES_NEW);
 patch("image token estimate", "// ccr-image-token-estimate-v1", IMAGE_TOKENS_OLD, IMAGE_TOKENS_NEW);
+patch("configured model route", "// ccr-relay-model-route-v1:", MODEL_ROUTE_OLD, MODEL_ROUTE_NEW);
 
-// 11) npm override 不能修复 CCR 内嵌的 @fastify/static 8.2.0。
+if (!src.includes(SIG_MARK)) {
+  const bad = SIG_EDITS.filter(([oldText]) => src.split(oldText).length !== 2);
+  if (bad.length) missing.push("thought signature (" + bad.length + " anchors missing or not unique)");
+  else {
+    for (const [oldText, newText] of SIG_EDITS) src = src.replace(oldText, () => newText);
+    changed = true;
+  }
+}
+
+// 13) npm override 不能修复 CCR 内嵌的 @fastify/static 8.2.0。
 //     校验原代码指纹后整段移除旧实现，改为加载锁文件中的已修复版本；未知 bundle 拒绝写入。
 const staticStart = "// node_modules/.pnpm/@fastify+static@8.2.0/node_modules/@fastify/static/lib/dirList.js";
 const staticEnd = "// node_modules/.pnpm/tiktoken@1.0.22/node_modules/tiktoken/tiktoken_bg.cjs";
@@ -493,7 +599,7 @@ if (changed) {
     if (fs.existsSync(temp)) fs.unlinkSync(temp);
   }
   if (process.exitCode) process.exit(process.exitCode);
-  console.log("[patch-ccr] patched: " + ["effort", "uncaughtException", "unhandledRejection", "stream reader", "upstream cancel", "error handler", "request body log", "fresh connection", "explicit stream", "JSON/SSE response", "tool result images", "image token estimate", "bundled static security"].join(", "));
+  console.log("[patch-ccr] patched: " + ["effort", "uncaughtException", "unhandledRejection", "stream reader", "upstream cancel", "error handler", "request body log", "fresh connection", "reasoning fallback", "explicit stream", "JSON/SSE response", "tool result images", "image token estimate", "configured model route", "thought signature", "bundled static security"].join(", "));
   process.exit(2);   // 刚打上：正在跑的实例还是旧代码，调用方应重启
 }
 console.log("[patch-ccr] already patched");

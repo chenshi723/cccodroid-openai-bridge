@@ -15,7 +15,7 @@ for(const n of ['node','bash','sh','flock','timeout','setsid','readlink','tee','
   const from=path.join(process.env.PREFIX,'bin',n);if(fs.existsSync(from))fs.symlinkSync(from,path.join(prefix,'bin',n));
 }
 const component=path.join(prefix,'lib/openai-bridge');fs.mkdirSync(component);
-for(const n of ['installer.cjs','component.cjs','package.json','package-lock.json'])fs.copyFileSync(path.join(kit,n),path.join(component,n));
+for(const n of ['installer.cjs','component.cjs','gui-models.cjs','package.json','package-lock.json'])fs.copyFileSync(path.join(kit,n),path.join(component,n));
 fs.cpSync(path.join(kit,'runtime'),path.join(component,'runtime'),{recursive:true});
 fs.cpSync(path.join(kit,'node_modules'),path.join(component,'node_modules'),{recursive:true,verbatimSymlinks:true});
 const allowed=new Set(['PATH','PREFIX','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD','CCAPP_CLAUDE','CCAPP_LOADER','CCAPP_GLIBC_LIB','CCAPP_GLIBC_PRELOAD','CCAPP_CLAUDE_PRELOAD','CCAPP_ENOSYS_RUN','CCAPP_BIONIC_PRELOAD','CCAPP_SHELL','CCAPP_RUNTIME']);

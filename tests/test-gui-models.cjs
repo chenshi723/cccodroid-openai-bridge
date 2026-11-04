@@ -197,7 +197,7 @@ async function fixture(scenarios,run){
 
 function result(value,ids,truncated=false){
   noSecrets(value);
-  assert.deepEqual(value,{schema:1,id:'openai-bridge',models:ids.map(id=>({id})),truncated});
+  assert.deepEqual(value,{schema:1,id:'openai-bridge',models:ids.map(id=>typeof id==='string'?{id}:id),truncated});
   assert(Buffer.byteLength(JSON.stringify(value))<=RESULT_LIMIT,'complete UTF-8 JSON result stays within 128 KiB');
 }
 function requestOnly(requests,target='https://models.example.invalid/v1/models',key=fakeKey){
@@ -238,11 +238,74 @@ for(const [endpoint,target] of [
   result(await listModels({...input,endpoint}),['fixture-one']);requestOnly(requests,target);
 }));
 
-test('success returns only schema/id/model ids/truncated, never upstream metadata or keys',()=>fixture([
+test('success discards arbitrary upstream metadata and keys without inventing a context window',()=>fixture([
   reply({data:[{id:'fixture-model',owned_by:upstreamMarker,apiKey:fakeKey,extra:{private:savedKey}}],apiKey:fakeKey})
 ],async({listModels,requests})=>{
   result(await listModels(input),['fixture-model']);requestOnly(requests);
 }));
+
+for(const field of ['context_window','contextWindow','max_input_tokens','context_length','max_context_tokens']){
+  for(const nested of [false,true])test('canonical context_window from '+(nested?'top_provider.':'')+field,()=>fixture([
+    reply({data:[{id:'fixture-context',...(nested?{top_provider:{[field]:131072}}:{[field]:131072}),max_tokens:2048,owned_by:upstreamMarker,extra:{key:fakeKey}}]})
+  ],async({listModels,requests})=>{
+    result(await listModels(input),[{id:'fixture-context',context_window:131072}]);requestOnly(requests);
+  }));
+}
+
+test('context windows accept numeric integer boundaries but never strings, output limits or arbitrary nested data',()=>{
+  const invalid=[null,true,false,'32768',' 32768 ', '32k','1e5','0x8000','200000',{},[],[32768],1023,0,-1,16777217,32768.5,1e30];
+  const data=invalid.map((value,i)=>({id:'fixture-invalid-'+i,context_window:value,contextWindow:value,max_input_tokens:value,context_length:value,max_context_tokens:value,top_provider:{context_window:value},max_tokens:200000}));
+  data.push({id:'fixture-min',context_length:1024},{id:'fixture-max',max_input_tokens:16777216},
+    {id:'fixture-missing'},{id:'fixture-output-only',max_tokens:200000,max_output_tokens:1000000,output_tokens:500000},
+    {id:'fixture-arbitrary-nested',metadata:{context_window:32768},limits:{context_length:65536}},
+    {id:'fixture-nested-array',top_provider:[{context_length:32768}]} );
+  return fixture([reply({data})],async({listModels,requests})=>{
+    result(await listModels(input),[...invalid.map((_,i)=>'fixture-invalid-'+i),{id:'fixture-min',context_window:1024},{id:'fixture-max',context_window:16777216},'fixture-missing','fixture-output-only','fixture-arbitrary-nested','fixture-nested-array']);requestOnly(requests);
+  });
+});
+
+test('context extraction has deterministic field priority, skips invalid values and keeps first unique ID',()=>fixture([
+  reply({data:[
+    {id:'fixture-priority',context_window:32768,contextWindow:65536,max_input_tokens:98304,context_length:131072,max_context_tokens:262144,top_provider:{context_length:524288}},
+    {id:'fixture-priority',context_window:999999},
+    {id:'fixture-fallback',context_window:'not numeric',context_length:65536},
+    {id:'fixture-nested',context_length:1023,top_provider:{context_length:131072}},
+    {id:'fixture-first-without-window'},{id:'fixture-first-without-window',context_window:131072}
+  ]})
+],async({listModels,requests})=>{
+  result(await listModels(input),[{id:'fixture-priority',context_window:32768},{id:'fixture-fallback',context_window:65536},{id:'fixture-nested',context_window:131072},'fixture-first-without-window']);requestOnly(requests);
+}));
+
+for(const raw of ['1e999','-1e999','32768.5'])test('non-finite or fractional context JSON '+raw+' is omitted',()=>fixture([
+  reply('{"data":[{"id":"fixture-not-integer","context_window":'+raw+'}]}',{raw:true})
+],async({listModels,requests})=>{
+  result(await listModels(input),['fixture-not-integer']);requestOnly(requests);
+}));
+
+test('credential echoes in allowed context fields are not disclosed even when the key is numeric',()=>fixture([
+  reply({data:[{id:'fixture-context-key',context_window:12345,top_provider:{context_length:1234567}},{id:'fixture-string-key',context_window:'12345'}]})
+],async({listModels,requests})=>{
+  const value=await listModels({...input,apiKey:'12345'});result(value,['fixture-context-key','fixture-string-key']);
+  assert(!JSON.stringify(value).includes('12345'));requestOnly(requests,'https://models.example.invalid/v1/models','12345');
+}));
+
+test('context fields contribute to the 128 KiB serialized result budget',()=>{
+  const ids=Array.from({length:500},(_,i)=>'模'.repeat(190)+'-'+String(i).padStart(3,'0'));
+  const entries=ids.map(id=>({id,context_window:16777216}));
+  return fixture([reply({data:entries})],async({listModels,requests})=>{
+    const value=await listModels(input);assert(value.models.length>0&&value.models.length<500);
+    result(value,entries.slice(0,value.models.length),true);
+    const next={...value,models:[...value.models,entries[value.models.length]]};
+    assert(Buffer.byteLength(JSON.stringify(next))>RESULT_LIMIT,'next canonical model exceeds the complete UTF-8 result budget');requestOnly(requests);
+  });
+});
+
+test('context metadata does not weaken the 500 unique model or credential-echo filters',()=>{
+  const entries=Array.from({length:501},(_,i)=>({id:'fixture-context-'+i,context_window:131072}));
+  return fixture([reply({data:[{id:'echo-'+fakeKey,context_window:65536},...entries]})],async({listModels,requests})=>{
+    result(await listModels(input),entries.slice(0,500),true);requestOnly(requests);
+  });
+});
 
 for(const retained of [false,true]){
   const label=retained?'saved-key discovery':'new-key discovery',key=retained?savedKey:fakeKey;
