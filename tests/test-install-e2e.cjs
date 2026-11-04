@@ -38,9 +38,9 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
 (async()=>{
   const sourceCli=path.join(sourceKit,'node_modules/@musistudio/claude-code-router/dist/cli.js');
   const sourceBytes=fs.readFileSync(sourceCli),sourceStat=fs.statSync(sourceCli);
-  const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'kit-e2e-'));
+  const tmp=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'kit-e2e-')));
   const home=path.join(tmp,'client-home');fs.mkdirSync(home);
-  const allowed=new Set(['PATH','PREFIX','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR']);
+  const allowed=new Set(['PATH','PREFIX','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR','TERMUX_APP__DATA_DIR']);
   testEnv=Object.fromEntries(Object.entries(process.env).filter(([k])=>allowed.has(k)));
   Object.assign(testEnv,{HOME:home,NPM_CONFIG_USERCONFIG:path.join(home,'no-npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(home,'no-global-npmrc'),NPM_CONFIG_CACHE:path.join(home,'.npm'),CCR_BRIDGE_START_TIMEOUT:'30'});
   kit=path.join(tmp,'component-source');fs.mkdirSync(kit);

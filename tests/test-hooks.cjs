@@ -27,7 +27,7 @@ async function until(check,label,limit=5000){
   throw new Error('Timeout: '+label);
 }
 async function fixture(){
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'bridge-hooks-'));
+  const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'bridge-hooks-')));
   const server=net.createServer();
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
   const port=server.address().port;await new Promise(resolve=>server.close(resolve));
@@ -49,12 +49,12 @@ process.on('SIGTERM',()=>{fs.appendFileSync(path.join(state,'fake-stops'),String
   fs.mkdirSync(path.dirname(entry),{recursive:true});fs.writeFileSync(entry,'// fake component entry');
   fs.writeFileSync(path.join(dir,'port'),String(port));
   fs.writeFileSync(path.join(dir,'.ccr-bridge-kit.json'),JSON.stringify({id:'ccr-bridge-kit',target:dir,componentEntry:entry}));
-  const env={...process.env,HOME:path.join(dir,'client-home'),CCR_BRIDGE_INTERVAL:'0.2',CCR_BRIDGE_GRACE:'0',CCR_BRIDGE_FAIL_LIMIT:'1',CCR_BRIDGE_START_TIMEOUT:'5',ANTHROPIC_BASE_URL:'http://127.0.0.1:'+port};
+  const env={...process.env,HOME:path.join(dir,'client-home'),CCR_BRIDGE_INTERVAL:'0.2',CCR_BRIDGE_GRACE:'0',CCR_BRIDGE_HEALTH_GRACE:'0',CCR_BRIDGE_FAIL_LIMIT:'1',CCR_BRIDGE_START_TIMEOUT:'5',ANTHROPIC_BASE_URL:'http://127.0.0.1:'+port};
   for(const name of ['CCAPP_RUN','CLAUDECODE','CLAUDE_CODE_ENTRYPOINT','SERVICE_PORT','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'])delete env[name];
   const healthy=()=>fetch('http://127.0.0.1:'+port+'/health',{signal:AbortSignal.timeout(200)}).then(r=>r.ok,()=>false);
   const hook=more=>run('bash',[path.join(dir,'start-bridge.sh'),'--hook'],{...env,...more});
   const alive=(file,script)=>{
-    try{const pid=Number(fs.readFileSync(path.join(state,file),'utf8'));const args=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split('\0');return args[1]===script?pid:null;}catch{return null;}
+    try{const pid=Number(fs.readFileSync(path.join(state,file),'utf8'));const args=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split('\0');const exe=fs.readlinkSync('/proc/'+pid+'/exe');if(/^\/(?:system|apex\/com\.android\.runtime(?:@[^/]*)?)\/bin\/linker64(?: \(deleted\))?$/.test(exe))args.shift();return args[1]===script?pid:null;}catch{return null;}
   };
   const clean=async()=>{
     for(const [file,script] of [['watchdog.pid',path.join(dir,'watchdog.sh')],['.claude-code-router.pid',cli]]){
@@ -200,6 +200,66 @@ async function test(name,body){
     await until(f.healthy,'recovered CCR ready');
     assert.equal(f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),watch);
     assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+  });
+  await test('ready bridge gets a separate health grace without spending restart budget',async f=>{
+    assert.equal((await f.hook({CCR_BRIDGE_HEALTH_GRACE:'5'})).status,0);await until(f.healthy,'grace initial ready');await sleep(1200);
+    const pid=f.alive('.claude-code-router.pid',f.cli),attempts=fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8');
+    fs.writeFileSync(path.join(f.state,'fake-unhealthy'),'brief health outage');await sleep(1400);
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);assert.equal(fs.existsSync(path.join(f.state,'fake-stops')),false);
+    assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+    fs.rmSync(path.join(f.state,'fake-unhealthy'));await sleep(700);
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);
+    process.kill(pid,'SIGTERM');await until(()=>fs.readFileSync(path.join(f.state,'fake-starts'),'utf8')==='start\nstart\n','real exit bypasses running health grace');await until(f.healthy,'real exit ready');
+  });
+  await test('persistent service failure still exhausts budget when local transport works',async f=>{
+    assert.equal((await f.hook({CCR_BRIDGE_HEALTH_GRACE:'1'})).status,0);await until(f.healthy,'persistent health ready');await sleep(400);
+    fs.writeFileSync(path.join(f.state,'fake-unhealthy'),'persistent service fault');
+    await until(()=>fs.existsSync(path.join(f.state,'recovery.failed')),'finite service failure',10000);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\nstart\nstart\n');
+  });
+  await test('confirmed loopback outage waits without restarts and resumes the same bridge',async f=>{
+    // Only the fixture health helper is replaced; its real transport classifier is tested separately.
+    fs.writeFileSync(path.join(f.dir,'health.cjs'),`const fs=require('node:fs');process.exitCode=fs.existsSync(__dirname+'/transport-down')?2:0;`);
+    assert.equal((await f.hook()).status,0);await until(f.healthy,'transport initial ready');await sleep(400);
+    const pid=f.alive('.claude-code-router.pid',f.cli),attempts=fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8');
+    fs.writeFileSync(path.join(f.dir,'transport-down'),'outage');await sleep(1600);
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);assert.equal(fs.readFileSync(path.join(f.state,'recovery.attempts'),'utf8'),attempts);
+    assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);assert.equal(fs.existsSync(path.join(f.state,'fake-stops')),false);
+    fs.rmSync(path.join(f.dir,'transport-down'));
+    await until(()=>fs.readFileSync(path.join(f.state,'bridge.out'),'utf8').includes('local transport and bridge health recovered'),'transport recovery observed');
+    assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8'),'start\n');
+    fs.writeFileSync(path.join(f.dir,'transport-down'),'outage again');await sleep(400);
+    fs.writeFileSync(path.join(f.dir,'disabled'),'uninstalled\n');
+    await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'disabled during transport wait');
+    assert.equal(fs.existsSync(path.join(f.state,'recovery.failed')),false);assert.equal(f.alive('.claude-code-router.pid',f.cli),pid);
+  });
+  await test('long scheduling gaps invalidate health and failure samples without clearing durable budget',async f=>{
+    // Deterministic clock injection: Android ptrace launchers may resume SIGSTOP automatically.
+    const text=fs.readFileSync(path.join(root,'runtime/watchdog.sh'),'utf8');
+    const begin=text.indexOf('watchdog_healthy() {'),end=text.indexOf('\n# 本机独立回环',begin);
+    assert(begin>0&&end>begin);
+    const script=text.slice(begin,end)+String.raw`
+INTERVAL=5
+SECONDS=100
+LAST_PROBE=80
+FAILURES=2
+FAILED_SINCE=50
+HEALTHY_SINCE=50
+ATTEMPTS=2
+BRIDGE_HEALTH_LOG_HEALTHY_SINCE=50
+bridge_healthy() { BRIDGE_HEALTH_RC=0; return 0; }
+watchdog_healthy || exit 11
+[[ $HEALTHY_SINCE = -1 && $FAILED_SINCE = -1 && $FAILURES = 0 && $ATTEMPTS = 2 && $BRIDGE_HEALTH_LOG_HEALTHY_SINCE = -1 ]] || exit 12
+SECONDS=200
+LAST_PROBE=200
+FAILURES=2
+FAILED_SINCE=150
+HEALTHY_SINCE=150
+bridge_healthy() { SECONDS=$((SECONDS+20)); BRIDGE_HEALTH_RC=1; return 1; }
+watchdog_healthy && exit 13
+[[ $HEALTHY_SINCE = -1 && $FAILED_SINCE = -1 && $FAILURES = 0 && $ATTEMPTS = 2 ]] || exit 14
+`;
+    const result=await run('bash',['-c',script],f.env);assert.equal(result.status,0,result.stderr);
   });
   await test('persistent crashes exhaust a durable budget and Hook cannot rearm',async f=>{
     fs.writeFileSync(f.cli,"const fs=require('node:fs'),path=require('node:path');fs.appendFileSync(path.join(process.env.HOME,'.claude-code-router','fake-starts'),'start\\n');process.exitCode=1;\n");

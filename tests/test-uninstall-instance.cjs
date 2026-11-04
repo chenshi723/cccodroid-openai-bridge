@@ -15,7 +15,7 @@ const instanceId='1'.repeat(32),otherId='2'.repeat(32),port=34591;
 const hash=data=>crypto.createHash('sha256').update(data).digest('hex');
 const save=(file,value)=>fs.writeFileSync(file,JSON.stringify(value,null,2)+'\n',{mode:0o600});
 const fixture=(fn)=>{
-  const root=fs.mkdtempSync(path.join(os.tmpdir(),'bridge-uninstall-unit-'));
+  const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'bridge-uninstall-unit-')));
   const home=path.join(root,'home'),target=path.join(home,"bridge with quote's"),settings=path.join(home,'settings.json');
   fs.mkdirSync(target,{recursive:true});
   const registry=registration.fileOf(home),lock=path.join(path.dirname(registry),'openai-bridge.lock');
@@ -33,7 +33,7 @@ const fixture=(fn)=>{
   for(const name of [...runtimeFiles,'port','manage.cjs'])manifest.files[name]=hash(fs.readFileSync(path.join(target,name)));
   save(path.join(target,'.ccr-bridge-kit.json'),manifest);
   save(registry,registration.value(target,port,instanceId));
-  const allowed=['PATH','PREFIX','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD'];
+  const allowed=['PATH','PREFIX','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD','TERMUX_APP__DATA_DIR'];
   const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>allowed.includes(key)));
   env.HOME=home;
   const run=(entry,args,extra={})=>spawnSync(process.execPath,[path.join(source,entry),...args],{env:{...env,...extra},encoding:'utf8',timeout:20000});
@@ -361,6 +361,10 @@ for(const kind of ['bridge','watchdog'])test('fixed stop rejects Python masquera
     const pidFile=path.join(state,kind==='bridge'?'.claude-code-router.pid':'watchdog.pid');
     fs.writeFileSync(pidFile,String(child.pid)+'\n');
     const cmdline=fs.readFileSync('/proc/'+child.pid+'/cmdline','utf8').split('\0').filter(Boolean);
+    const exe=fs.readlinkSync('/proc/'+child.pid+'/exe');
+    if(/^\/(?:system|apex\/com\.android\.runtime(?:@[^/]*)?)\/bin\/linker64(?: \(deleted\))?$/.test(exe)){
+      assert.match(path.basename(cmdline[1]),/^python3(?:\.\d+)?$/);cmdline.splice(1,1);
+    }
     assert.deepEqual(cmdline,[kind==='bridge'?'node':'bash',file,...(kind==='bridge'?['start']:[])]);
     const r=f.run('component.cjs',f.scoped);
     assert.equal(r.status,0,r.stdout+r.stderr);

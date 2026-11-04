@@ -14,7 +14,7 @@ const allowedCodes = new Set([
   "ECONNREFUSED", "ECONNRESET", "EACCES", "EPERM", "EPIPE", "ETIMEDOUT",
   "EHOSTUNREACH", "ENETUNREACH", "EADDRNOTAVAIL", "DEADLINE_2000MS", "BAD_JSON",
   "RESPONSE_ABORTED", "RESPONSE_TOO_LARGE", "HTTP_STATUS", "HEALTH_STATUS",
-  "REQUEST_ERROR", "INVALID_ARGUMENTS", "LOG_UNSUPPORTED", "LOG_UNSAFE_PATH",
+  "REQUEST_ERROR", "LOOPBACK_UNAVAILABLE", "INVALID_ARGUMENTS", "LOG_UNSUPPORTED", "LOG_UNSAFE_PATH",
   "LOG_UNSAFE_FILE", "LOG_TOO_LARGE", "LOG_LOCK_BUSY", "LOG_LOCK_FAILED", "LOG_IO_ERROR",
 ]);
 let sandbox, home;
@@ -104,7 +104,7 @@ function preload(name, source) {
 }
 
 (async () => {
-  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-health-test-"));
+  sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-health-test-")));
   fs.chmodSync(sandbox, 0o700);
   home = state("isolated-home");
   try {
@@ -222,6 +222,37 @@ function preload(name, source) {
       };
     `);
     failed(await probe(1024, [], { nodeArgs: denied }), "EACCES");
+    // 单独服务失败不能冒充系统回环故障；独立随机端口对照仍须成功。
+    failed(await probe(1024, ["--diagnose"], { nodeArgs: denied }), "EACCES");
+    const transportDenied = preload("transport-denied", `
+      const net=require('node:net');
+      net.connect=()=>{
+        const socket=new(require('node:events').EventEmitter)();socket.destroy=()=>{};
+        process.nextTick(()=>socket.emit('error',Object.assign(new Error(${JSON.stringify(secret)}),{code:'EACCES'})));
+        return socket;
+      };
+    `);
+    const unavailable = await probe(1024, ["--diagnose"], { nodeArgs: [...denied, ...transportDenied] });
+    assert.equal(unavailable.code, 2);assert.deepEqual(codes(unavailable), ["LOOPBACK_UNAVAILABLE"]);
+    const controlTimeout = preload("control-timeout", `
+      require('node:net').connect=()=>{const socket=new(require('node:events').EventEmitter)();socket.destroy=()=>{};return socket;};
+    `);
+    const unavailableTimeout=await probe(1024,["--diagnose"],{nodeArgs:[...denied,...controlTimeout]});
+    assert.equal(unavailableTimeout.code,2);assert.deepEqual(codes(unavailableTimeout),["LOOPBACK_UNAVAILABLE"]);
+    assert.ok(unavailableTimeout.elapsed>=1900&&unavailableTimeout.elapsed<4500);
+    const unavailableLog=path.join(state('transport-log'),'health.log');
+    const loggedUnavailable=await probe(1024,["--log",unavailableLog,"--diagnose"],{nodeArgs:[...denied,...transportDenied]});
+    assert.equal(loggedUnavailable.code,2);assert.deepEqual(codes(loggedUnavailable),[]);
+    assert.match(logLines(unavailableLog),/health LOOPBACK_UNAVAILABLE\n$/);
+    const noListener = preload("cannot-create-control", `
+      const net=require('node:net'),original=net.createServer;
+      net.createServer=(...args)=>{const server=original(...args);server.listen=()=>{process.nextTick(()=>server.emit('error',{code:'EMFILE'}));return server;};return server;};
+    `);
+    failed(await probe(1024, ["--diagnose"], { nodeArgs: [...denied, ...noListener] }), "EACCES");
+    await withServer((req,res)=>{},async port=>{
+      const result=await probe(port,["--diagnose"]);failed(result,"DEADLINE_2000MS");
+      assert.ok(result.elapsed<5000,'responsive local control must not mask a hung bridge');
+    });
     const unknownError = preload("unknown-error", `
       require('node:http').get = () => { throw Object.assign(new Error(${JSON.stringify(secret)}), { code: ${JSON.stringify(secret)} }); };
     `);

@@ -1,5 +1,24 @@
 # Verification record — preview proposal
 
+## r18 watchdog candidate — 2026-11-04 (local source verification)
+
+This is a source candidate, not a published component. Development began at `e8a70d1` and preserved the installed r17 patch. Before submission the branch was rebased onto the actual r17 PR commit `3a7ca80`, retaining its author history, complete response regression suite and release notes. No running installation, key, application file or trust metadata was altered. GitHub API verification confirmed market revision 17; revision 18 is proposed. An earlier market Git fetch failed with TLS EOF, so the isolated market tree is for recipe validation only, not a ready-to-merge market diff.
+
+Implemented: separate ready-instance health grace (default 300 s), diagnostic-only ephemeral loopback challenge/response, non-destructive wait on a demonstrated control-transport failure, and invalidation of continuous-health/failure samples after scheduling gaps. Existing recovery fault markers, component/instance checks and finite crash/patch recovery remain authoritative. This does not prove the original Android outage's cause.
+
+Local test evidence (Android aarch64, Node 26; isolated HOME, fake keys and loopback only):
+
+- Health suite passes: ordinary 0/1 interface, diagnostic exit 2 for a listening control denied/timed out, successful independent control does not mask a stuck bridge, bind/resource failure is not classified as transport deferral, bounded private diagnostics including `LOOPBACK_UNAVAILABLE`.
+- Hook/watchdog: final combined run **44/44 passed**, including deterministic scheduling-gap coverage. Tests cover separate grace, actual exit, service failure budget, control failure recovery, disabled/removed/changed component, lock release and concurrent ensure. Test fixture argv inspection now handles Android's linker layout.
+- Real 35-second HTTP-response outage: one fake bridge start, same PID, live heartbeat, no fault marker; restored health succeeds with the new default (no override). This is fault injection, not a phone-freezer reproduction.
+- Registration 5/5; installer 20/20 with canonical HOME/TMPDIR; models helper 104/104; targeted GUI status/recovery/HOME suite 19/19. Bundled installation lifecycle passed, including cold ensure, explicit fault persistence, stop/start and scoped uninstall/purge.
+- Response/patch/atomic/router suite initially passed 84/84 with the retained r17 patch. After rebasing onto the original r17 commit, its complete suite remained unchanged and passed **92/92**, including all eight signature regressions; selftest passed **4/4** again. Security functional controls, HTTP 9/9 and the full bundled install lifecycle passed with the same r17-compatible runtime.
+- Retirement tests: 44 pass, two initial argv-layout assertion failures, one real-hardlink skip. Both failures were corrected in the test fixture; final combined run **46 pass / 0 fail / 1 hardlink skip**. Minimal fixture env retains `TERMUX_APP__DATA_DIR`, required to spawn on this Android installation. Production permission/identity checks were not weakened.
+- Recipe sync and `check-recipes.mjs` pass in an isolated market worktree. Lockfile/dependency versions unchanged. No `verified.json`, signed archive or external publication was produced.
+
+Disclosed limits: the first installer run with aliased HOME/TMPDIR failed two path assertions; canonical paths passed. Initial management/E2E fixtures lost Android execution environment and failed EACCES before executing test logic; fixture env was corrected and tests rerun. One full GUI test process exceeded its background runtime and was killed; only the targeted 19-case run is claimed. A SIGSTOP scheduler experiment did not pause the watchdog under this device's ptrace launcher (trace showed uninterrupted probes), so it was replaced by deterministic shell-clock injection and is not claimed as real suspend coverage. Full online npm-ci installation, hosted CI, dependency-network audit, signed market install, real overnight background behavior and APK-update acceptance were not run. No full `npm test` pass is claimed.
+
+
 ## Gemini thought-signature candidate — 1.0.5-r17, 2026-11-03
 
 Adds patch 14 (`ccr-thought-signature-v1`) for cccodroid #91: Gemini 3 OpenAI-compatible endpoints return 400 when an assistant tool call is replayed without its `extra_content.google.thought_signature`. Only `runtime/patch-ccr.js`, its response regression test, recipe revision/notes, SKILL and README change; installer, watchdog, dependencies and lockfile are unchanged.

@@ -18,6 +18,9 @@ jobs:
       - run: npm test
         env:
           TMPDIR: ${{ runner.temp }}
+      - run: python3 tests/test-watchdog-transient.py
+        env:
+          TMPDIR: ${{ runner.temp }}
       - name: Dependency security gate
         run: npm audit --omit=dev --audit-level=moderate
       - name: Effective bundled dependency security gate

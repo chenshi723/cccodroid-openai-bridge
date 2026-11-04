@@ -11,7 +11,7 @@ const source=path.resolve(__dirname,'..'),api=require('../installer.cjs');
 const upstreamKey='fixture-upstream-key-DO-NOT-OUTPUT';
 const input={endpoint:'https://api.example.invalid/v1',apiKey:upstreamKey,model:'fixture-model'};
 const fixture=(fn)=>{
-  const root=fs.mkdtempSync(path.join(os.tmpdir(),'bridge-gui-unit-')),home=path.join(root,'home'),kit=path.join(root,'component');
+  const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'bridge-gui-unit-'))),home=path.join(root,'home'),kit=path.join(root,'component');
   fs.mkdirSync(home);fs.mkdirSync(path.join(kit,'runtime'),{recursive:true});
   for(const file of ['installer.cjs','component.cjs','package.json','package-lock.json'])fs.copyFileSync(path.join(source,file),path.join(kit,file));
   fs.copyFileSync(path.join(source,'runtime/service-registration.cjs'),path.join(kit,'runtime/service-registration.cjs'));
@@ -26,7 +26,7 @@ const fixture=(fn)=>{
   const pkg=path.join(kit,'node_modules/@musistudio/claude-code-router');fs.mkdirSync(pkg,{recursive:true});
   fs.writeFileSync(path.join(pkg,'package.json'),JSON.stringify({version:'1.0.73'}));
   fs.writeFileSync(path.join(pkg,'fake-copy'),'bundle-is-read-only');
-  const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>['PATH','PREFIX','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD'].includes(k)));
+  const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>['PATH','PREFIX','LANG','TZ','TMPDIR','ANDROID_ROOT','ANDROID_DATA','LD_PRELOAD','TERMUX_APP__DATA_DIR'].includes(k)));
   env.HOME=home;
   const target=path.join(home,'.local/share/ccr-bridge-kit'),settings=path.join(home,'.claude/settings.json'),registry=path.join(home,'.cccodroid/services/openai-bridge.json');
   const run=(command,body,extra={})=>spawnSync(process.execPath,[path.join(kit,'component.cjs'),command,...(extra.args||[])],{env:{...env,...extra.env},input:body===undefined?undefined:typeof body==='string'?body:JSON.stringify(body),encoding:'utf8',timeout:20000});
