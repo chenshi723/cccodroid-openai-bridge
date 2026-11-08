@@ -168,7 +168,7 @@ async function main() {
   const patch = fs.readFileSync(patchFile, "utf8");
   // 取补丁的纯字符串常量用于在临时副本还原原版/上一版，不执行补丁的文件 I/O 部分。
   const names = ["EFF", "UE", "UR", "READER", "CANCEL", "H", "BODY", "AGENT", "STREAM", "TOOL_IMAGES", "IMAGE_TOKENS", "REASON", "MODEL_ROUTE"];
-  const keys = names.flatMap((name) => [name + "_OLD", name + "_NEW"]).concat(["SSE_OLD", "SSE_NEW", "SSE_FALLBACK", "SSE_MARK", "SIG_MARK", "SIG_EDITS"]);
+  const keys = names.flatMap((name) => [name + "_OLD", name + "_NEW"]).concat(["SSE_OLD", "SSE_NEW", "SSE_FALLBACK", "SSE_MARK", "SIG_MARK", "SIG_EDITS", "MODEL_ROUTE_V1", "SIG_V1_FRAGMENTS"]);
   const constants = vm.runInNewContext(patch.slice(patch.indexOf("const EFF_OLD"), patch.indexOf("\nlet src =")) + "\n({" + keys.join(",") + "});");
   let original = fs.readFileSync(cliFile, "utf8");
   for (const [oldText, newText] of [...constants.SIG_EDITS].reverse()) original = original.replace(newText, oldText);
@@ -316,7 +316,8 @@ async function main() {
     return vm.runInNewContext(source.slice(start,end)+'\ngetUseModel;', {getProjectSpecificRouter:async()=>undefined});
   }
   await test('Actual unpatched CCR overrides bare non-default IDs; patched CCR preserves configured session selections', async () => {
-    const config = {Providers:[{name:'relay',models:['test-default','test-second','claude-haiku-explicit','Org/Model-X']}],Router:{default:'relay,test-default',think:'relay,test-default',background:'relay,test-default',longContext:'relay,test-default',webSearch:'relay,test-default',longContextThreshold:60000}};
+    const provider=(name,models)=>({name,api_base_url:`https://${name}.invalid/v1/chat/completions`,api_key:`fixture-${name}`,models});
+    const config = {Providers:[provider('relay',['test-default','test-second','claude-haiku-explicit','Org/Model-X'])],Router:{default:'relay,test-default',think:'relay,test-default',background:'relay,test-default',longContext:'relay,test-default',webSearch:'relay,test-default',longContextThreshold:60000}};
     const request = (model,extra={}) => ({body:{model,...extra},log:{info(){}}});
     const before = actualModelRouter(original),after = actualModelRouter(patched);
     assert.equal(await before(request('test-second'),1,config),config.Router.default,'unpatched negative control');
@@ -328,7 +329,29 @@ async function main() {
     for(const id of ['unconfigured-model','test-SECOND','org/model-x','claude-haiku-alias'])assert.equal(await after(request(id),1,config),config.Router.default);
     assert.equal(await after(request('relay,test-second'),1,config),'relay,test-second','explicit legacy routing remains supported');
     assert.equal(await after(request('other,test-second'),1,config),'other,test-second','patch never fabricates a relay match from a comma route');
-    assert.equal(await after(request('test-second'),1,{...config,Providers:[{name:'not-relay',models:['test-second']}]}),config.Router.default,'only this component relay is affected');
+    assert.equal(await after(request('test-second'),1,{...config,Providers:[provider('not-relay',['test-second'])]}),'not-relay,test-second','a single usable provider can declare a bare ID');
+    const multi={Providers:[provider('relay',['test-default','shared']),provider('backup',['backup-model','shared'])],Router:config.Router,
+      MODEL_ROUTES:{'test-default':'relay,test-default','backup-model':'backup,backup-model','backup/shared':'backup,shared','shared':'relay,shared'}};
+    assert.equal(await after(request('backup-model'),1,multi),'backup,backup-model','MODEL_ROUTES selects the second upstream');
+    assert.equal(await after(request('backup-model',{thinking:{type:'adaptive'}}),100000,multi,{input_tokens:100000}),'backup,backup-model','mapping wins over think/long-context fallbacks');
+    assert.equal(await after(request('backup/shared'),1,multi),'backup,shared','duplicate upstream IDs use the exposed alias');
+    assert.equal(await after(request('shared'),1,multi),'relay,shared','bare duplicate IDs follow the explicit map');
+    assert.equal(await after(request('shared'),1,{...multi,MODEL_ROUTES:{}}),config.Router.default,'ambiguous duplicates fall back instead of guessing');
+    assert.equal(await after(request('test-default'),1,{...multi,MODEL_ROUTES:{'test-default':'missing,model'}}),config.Router.default,'invalid mapping targets fall through');
+    assert.equal(await after(request('relay,test-default'),1,multi),'relay,test-default','explicit routes are untouched while MODEL_ROUTES is active');
+  });
+  await test('A v1 model-route and signature patch upgrades in place to provider-scoped v2', () => {
+    let v1 = patched
+      .replace(constants.MODEL_ROUTE_NEW, constants.MODEL_ROUTE_V1)
+      .split('// ccr-thought-signature-v2').join('// ccr-thought-signature-v1');
+    for (const [oldText, newText] of constants.SIG_V1_FRAGMENTS) v1 = v1.replace(newText, oldText);
+    assert.ok(v1.includes('// ccr-relay-model-route-v1:') && v1.includes('// ccr-thought-signature-v1'));
+    const copy = fixture('v1-upgrade', v1);
+    apply(copy, 2);
+    assert.equal(fs.readFileSync(copy.cli, 'utf8'), patched);
+    assert.ok(!fs.readFileSync(copy.cli, 'utf8').includes('// ccr-thought-signature-v1'));
+    apply(copy, 0);
+    noTemps(copy);
   });
   await test('An unknown CCR model-route anchor fails closed before any bundle write', () => {
     const source = original.replace(constants.MODEL_ROUTE_OLD,constants.MODEL_ROUTE_OLD.replace('config.Router','config.UnexpectedRouter'));
@@ -690,7 +713,7 @@ async function main() {
   // 签名记在 transformer 所在的全局里，请求侧回填也读同一个全局：两段实际发布代码放进同一个 vm 上下文。
   function signatureHarness() {
     const start = patched.indexOf("var Vf = "), end = patched.indexOf("\n};\nvar Cn =", start);
-    const reqStart = patched.indexOf("  // ccr-thought-signature-v1: return"), reqEnd = patched.indexOf("\n  let u, f = AbortSignal.timeout", reqStart);
+    const reqStart = patched.indexOf("  // ccr-thought-signature-v2: return"), reqEnd = patched.indexOf("\n  let u, f = AbortSignal.timeout", reqStart);
     assert.ok(start > 0 && end > start && reqStart > 0 && reqEnd > reqStart, "actual published thought-signature boundaries");
     const sandbox = vm.createContext({
       Response, ReadableStream, TextEncoder, TextDecoder, Error, TypeError, console,
@@ -734,6 +757,19 @@ async function main() {
     assert.deepEqual(other[0].extra_content, signed("skip_thought_signature_validator"), "another Gemini model never receives a foreign signature");
   });
 
+  await test("Remembered Gemini signatures are scoped to the same upstream provider", async () => {
+    const { transformer: tf, outgoing } = signatureHarness(), ctx = client(true), model = "gemini-3-pro-preview";
+    ctx.req.provider = "relay";
+    outgoing({ model, messages: [] }, ctx);
+    const frames = [
+      chunk({ tool_calls: [{ index: 0, id: "call_p", type: "function", function: { name: "Read", arguments: "{}" }, extra_content: signed("SIG_P") }] }),
+      chunk({}, "tool_calls"), { choices: [], usage }
+    ];
+    await events(await tf.transformResponseIn(upstream(sse(frames), "text/event-stream").response, ctx));
+    const history = [{ role: "assistant", content: "", tool_calls: [{ id: "call_p", type: "function", function: { name: "Read", arguments: "{}" } }] }];
+    assert.deepEqual(assistantCalls(outgoing({ model, messages: history }, { req: { provider: "backup" } }))[0][0].extra_content, signed("skip_thought_signature_validator"), "a different provider never receives the signature");
+    assert.deepEqual(assistantCalls(outgoing({ model, messages: history }, { req: { provider: "relay" } }))[0][0].extra_content, signed("SIG_P"));
+  });
   for (const stream of [false, true]) {
     await test("Gemini JSON tool-call signature round trip without leaking into Anthropic output, stream=" + stream, async () => {
       const { transformer: tf, outgoing } = signatureHarness(), ctx = client(stream), model = "gemini-3-flash-preview";

@@ -50,6 +50,16 @@ function deny(f,body,code='RUNTIME_CONFLICT',options={}){
 }
 function config(f){return JSON.parse(fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json'),'utf8'));}
 function write(file,value){fs.writeFileSync(file,JSON.stringify(value,null,2)+'\n',{mode:0o600});}
+function installMulti(f){
+  const {value}=saved(f);
+  const connectionFile=path.join(f.target,'connection.json'),configFile=path.join(f.target,'runtime-home/.claude-code-router/config.json');
+  const connection=JSON.parse(fs.readFileSync(connectionFile)),port=Number(new URL(connection.baseUrl).port);
+  const secondary={endpoint:'https://secondary.example.invalid/v1/chat/completions',apiKey:'secondary-key',model:'secondary-model',models:['secondary-model','shared-model']};
+  const multi=api.validateConfig({...input,endpoint:value.endpoint,models:[input.model,'primary-two'],providers:[secondary]},port);
+  write(configFile,api.routerConfig(multi,port,connection.apiKey));
+  write(connectionFile,api.connectionConfig(multi,connection.baseUrl,connection.apiKey));
+  return {connectionFile,configFile,connection,port,secondary,multi,primaryEndpoint:value.endpoint};
+}
 
 test('GUI status without installation is nonsecret, read-only and never creates runtime',()=>fixture(f=>{
   const before=snapshot(f.home),r=f.run('gui-status'),v=result(r);
@@ -97,6 +107,65 @@ test('GUI multi-model save/status persist only IDs, keep default routes and reta
   const last=saved(f,{...input,apiKey:'',model:'fixture-replacement',models:nextIds}).value;
   assert.equal(last.model,'fixture-replacement');assert.deepEqual(last.models,nextIds);assert.equal(config(f).Router.default,'relay,fixture-replacement');
 }));
+
+test('GUI preserves a CLI-added secondary upstream while the App edits the visible list',()=>fixture(f=>{
+  const {connectionFile,multi,primaryEndpoint}=installMulti(f),status=result(f.run('gui-status'));
+  assert.deepEqual(status.models,multi.models);assert.equal(status.endpoint,primaryEndpoint);assert.equal(status.model,input.model);
+  const edited=[input.model,'secondary-model','shared-model','new-model'],{r,value}=saved(f,{...input,apiKey:'',models:edited});
+  assert.deepEqual(value.models,edited);assert(!r.stdout.includes('secondary-key'));
+  const router=config(f);
+  assert.equal(router.Providers.length,2);
+  assert.deepEqual(router.Providers[0].models,[input.model,'new-model']);
+  assert.deepEqual(router.Providers[1].models,['secondary-model','shared-model']);
+  assert.equal(router.Providers[1].api_key,'secondary-key');
+  assert.deepEqual(router.MODEL_ROUTES,{[input.model]:'relay,'+input.model,'secondary-model':'relay-2,secondary-model','shared-model':'relay-2,shared-model','new-model':'relay,new-model'});
+  const connection=JSON.parse(fs.readFileSync(connectionFile));
+  assert.deepEqual(connection.models,edited);assert.equal(Object.hasOwn(connection,'providers'),false);
+}));
+
+test('GUI can make a secondary model the default without dropping its provider',()=>fixture(f=>{
+  const {connectionFile,multi}=installMulti(f),{value}=saved(f,{...input,apiKey:'',model:'secondary-model',models:multi.models});
+  assert.equal(value.model,'secondary-model');assert.deepEqual(value.models,multi.models);
+  const router=config(f);
+  for(const name of ['default','background','think','longContext','webSearch'])assert.equal(router.Router[name],'relay-2,secondary-model');
+  assert.equal(JSON.parse(fs.readFileSync(connectionFile)).model,'secondary-model');
+  assert.equal(result(f.run('gui-status')).model,'secondary-model');
+}));
+
+test('multi-provider single-model saves are idempotent and keep secondary providers',()=>fixture(f=>{
+  installMulti(f);
+  const body={...input,apiKey:'',model:input.model};
+  saved(f,body);
+  const before=snapshot(f.home);
+  saved(f,body);
+  const after=snapshot(f.home);
+  delete before['.local/share/ccr-bridge-kit/start-called'];delete after['.local/share/ccr-bridge-kit/start-called'];
+  assert.deepEqual(after,before,'a repeated single-model save must not rewrite or stop the multi-provider runtime');
+  assert.equal(config(f).Providers.length,2);
+  assert.deepEqual(result(f.run('gui-status')).models,[input.model]);
+}));
+
+test('multi-provider status rejects noncanonical providers, routes and connection fields',()=>{
+  const connectionFile=f=>path.join(f.target,'connection.json'),configFile=f=>path.join(f.target,'runtime-home/.claude-code-router/config.json');
+  for(const mutate of [
+    f=>{const c=config(f);c.Providers[1].api_base_url='https://other.example.invalid/private';write(configFile(f),c);},
+    f=>{const c=config(f);c.Providers[1].models=c.Providers[1].models.filter(model=>model!=='shared-model');write(configFile(f),c);},
+    f=>{const c=config(f);c.MODEL_ROUTES['secondary-model']='relay,secondary-model';write(configFile(f),c);},
+    f=>{const c=config(f);c.MODEL_ROUTES.extra='relay,extra';write(configFile(f),c);},
+    f=>{const c=config(f);c.Providers[1].name='relay';write(configFile(f),c);},
+    f=>{const c=config(f);c.Providers[0].models=[input.model];write(configFile(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connectionFile(f)));c.models=[input.model];write(connectionFile(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connectionFile(f)));c.providers=[];write(connectionFile(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connectionFile(f)));c.apiKey='f'.repeat(48);write(connectionFile(f),c);}
+  ])fixture(f=>{
+    const {multi}=installMulti(f);mutate(f);
+    deny(f,{...input,apiKey:'',model:input.model,models:multi.models});
+    const before=snapshot(f.home),status=f.run('gui-status');
+    assert.equal(status.status,1,status.stdout+status.stderr);
+    assert.equal(JSON.parse(status.stderr).error.code,'RUNTIME_CONFLICT');
+    assert.deepEqual(snapshot(f.home),before);
+  });
+});
 
 test('legacy single-model instances can explicitly add models and old clients can save single-model format',()=>fixture(f=>{
   saved(f);const file=path.join(f.target,'connection.json');

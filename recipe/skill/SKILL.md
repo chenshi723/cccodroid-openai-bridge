@@ -49,6 +49,8 @@ openai-bridge configure
 
 用户填写完整 Chat Completions URL（例如 `https://api.example.com/v1/chat/completions`）、自己有权使用的 API Key 和模型名。不是 Responses API，也不是仅填服务域名。**不要索要、读取、打印、转述 API Key 或密码，不要读取真实配置或 connection.json。**
 
+需要多个 OpenAI 兼容上游时，同一个 `configure` 会继续询问是否再添加一个 API；非交互安装也可在私有 `--config` JSON 里加可选 `providers` 数组（顶层仍是第一个上游）。每个附加项包含自己的 endpoint、API Key、模型和可选 models；名称默认 `relay-2` 等，重名模型在桥内显示为 `<provider>/<model>`，可见模型合计限 100。上游 Key 只写入私有 CCR 配置，`connection.json` 仍保持原格式；`openai-bridge status` 会列出上游名称、地址和模型 ID，不打印 Key。当前 App 的图形表单仍只编辑第一个 endpoint，但再次保存会保留附加上游；图形模型清单也只查询主 endpoint，不会把一家 Key 发给另一家。已有安装要新增上游，先按原有重配流程确认停用/备份并留档旧实例，再重新 `configure`；不要直接覆盖现有私有配置。
+
 已获用户授权后，AI 可非交互启动、查看状态（输出不含密钥）：
 
 ```sh
