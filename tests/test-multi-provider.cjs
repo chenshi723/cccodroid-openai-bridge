@@ -113,6 +113,26 @@ test('a partial internal multi-provider shape is rejected instead of silently do
   assert.throws(()=>api.validateConfig({...primary,connections:[]},3459));
 });
 
+test('internal inputs validate every credential, endpoint and model instead of bypassing normal checks',()=>{
+  const config=api.validateConfig(input,3459);
+  for(const mutate of [
+    value=>value.connections[1].endpoint='http://remote.invalid/v1/chat/completions',
+    value=>value.connections[1].apiKey='',
+    value=>value.connections[1].models=['bad,model'],
+    value=>value.connections[1].models=['secondary-model','secondary-model'],
+    value=>value.connections[1].extra='unsupported',
+    value=>value.routes['secondary-model']='foreign,model'
+  ]){const value=structuredClone(config);mutate(value);assert.throws(()=>api.validateConfig(value,3459));}
+});
+
+test('prototype-like visible IDs survive configuration round trips as own route keys',()=>{
+  const config=api.validateConfig({...primary,model:'__proto__',models:['__proto__','constructor','toString'],providers:[secondary]},3459);
+  const normalized=api.validateConfig(config,3459),router=api.routerConfig(normalized,3459,'local-key');
+  assert.equal(Object.hasOwn(router.MODEL_ROUTES,'__proto__'),true);
+  assert.equal(router.MODEL_ROUTES.__proto__,'relay,__proto__');
+  assert.equal(router.MODEL_ROUTES.constructor,'relay,constructor');
+});
+
 test('routerConfig never mutates its input or shares provider model arrays',()=>{
   const config=api.validateConfig(input,3459),before=structuredClone(config),router=api.routerConfig(config,3459,'local-key');
   assert.deepEqual(config,before);

@@ -64,8 +64,19 @@
 - 终端 `configure` 会在第一个 API 之后询问是否继续添加；非交互安装也可在私有 `--config` JSON 顶层增加可选 `providers` 数组。顶层 `endpoint`/`apiKey`/`model`/`models` 仍是第一个上游；每个附加项接受 `endpoint`、`apiKey`、`model`、可选 `models` 和可选 `name`。
 - 名称默认 `relay`、`relay-2`……，也可给 `name`（小写字母开头、1–32 位小写字母/数字/连字符，保留名 `relay` 只能给第一个上游）。模型 ID 全局唯一时直接暴露；重名时后出现的暴露为 `<provider>/<model>`，避免把请求发错上游。所有上游的可见模型合计仍限 1–100。
 - 私有 CCR 配置包含多个 `Providers` 和 `MODEL_ROUTES`（可见 ID → `provider,model`）；`connection.json` 仍保持 schema 1，只含本机地址、本地桥密钥、默认模型和可见模型列表。上游 Key 只存在私有 CCR 配置中（0600）；`openai-bridge status` 只列上游名称、地址和模型 ID，不打印 Key。
-- 当前 App 的图形表单仍只提交一个主 endpoint/Key；已有多个上游的 GUI 管理实例再次保存时，组件会保留附加上游及其路由，并按 App 提交的可见模型列表更新暴露集合。当前候选没有图形“新增上游”表单，新增上游通过终端配置完成；已有安装要增加上游，先按原有卸载/备份流程停用并留档旧实例，再重新 `configure`（GUI 管理的实例由 App 在重配时把已卸载目录改名留档）。
-- 图形模型清单仍只查询主 endpoint，不会把 A 家 Key 发给 B 家。多上游同名模型的 Gemini thought signature 按 `(provider, model)` 隔离；显式 `provider,model` 旧路由保持不变，未知 ID 继续走原 CCR 默认/长上下文/思考路由。
+- `gui-status` 通过 `capabilities.multiUpstream` 告知配套 App 能力，并返回不含密钥的 `upstreams:[{name,endpoint,hasKey,models:[{id,model?}]}]`。`model` 与可见 `id` 相同时可省略。配套 App 可一次提交完整 `upstreams` 新增、编辑或移除 API，无需卸载；旧单地址表单仍兼容，不会悄悄删掉附加上游。
+- `gui-configure` 完整拓扑的每一项只接受 `{name,endpoint,apiKey?,models:[{id,model?}]}`，顶层 `model` 指定全局默认可见 ID，顶层 `models` 必须与展开后的可见 ID 顺序一致。留空 Key 只复用**相同上游名称且同 origin**的已验证 Key；新增名称、改 origin 必须新填，删除主上游时保留剩余上游名称/模型别名。保存仍在共享锁内核对实例、原子提交两份配置，保留恢复故障和本地认证。
+- `gui-models` 新增可选 `provider` 指定当前 API，仅查询该 endpoint；留空 Key 按名称和 origin 核对，不会把 A 家 Key 发给 B 家，也不会向其他 API 自动发请求。旧 App 不传 `provider` 时只查主 endpoint。显式 `provider,model` 旧路由保持不变，未知 ID 继续走原 CCR 后备规则。
+
+已安装实例可用以下命令在线管理（先确认没有会话请求运行；私有 JSON 由用户填写，文件权限须为0600）：
+
+```sh
+openai-bridge add-provider --config /absolute/private/provider.json --yes
+openai-bridge edit-provider --provider relay-2 --config /absolute/private/provider.json --yes
+openai-bridge remove-provider --provider relay-2 --yes
+```
+
+新增/编辑 JSON 包含 `endpoint`、`apiKey`、`model`、可选 `models`/`name`，不是整个桥配置；编辑时 Key 留空可同名同源保留。命令不会自动更改 App 的接口清单，之后在配套 App 打开配置页保存/同步再新建会话。不能移除最后一个上游，不清恢复锁，不执行外来私有脚本。图形新增/删除入口需要同批配套 App，旧版会继续使用原单 API 表单。
 
 旧 App / 终端仍可用：用户自己运行 `openai-bridge configure`，输入完整 Chat Completions URL、自有 API Key、模型名并确认新增自己的 SessionStart Hook；`openai-bridge start` 等待本地就绪，`openai-bridge status` 查看不含密钥的状态。终端私有 JSON 也接受同样的可选 `models`。没有图形配置支持的 App 仍须在自定义接口中手工填写本机地址、模型和私有连接文件里的本地密钥。不要把远端 Key 当成本地 Key，不要把连接文件发给 AI 或公开。
 

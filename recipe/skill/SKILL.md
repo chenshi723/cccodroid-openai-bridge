@@ -49,7 +49,17 @@ openai-bridge configure
 
 用户填写完整 Chat Completions URL（例如 `https://api.example.com/v1/chat/completions`）、自己有权使用的 API Key 和模型名。不是 Responses API，也不是仅填服务域名。**不要索要、读取、打印、转述 API Key 或密码，不要读取真实配置或 connection.json。**
 
-需要多个 OpenAI 兼容上游时，同一个 `configure` 会继续询问是否再添加一个 API；非交互安装也可在私有 `--config` JSON 里加可选 `providers` 数组（顶层仍是第一个上游）。每个附加项包含自己的 endpoint、API Key、模型和可选 models；名称默认 `relay-2` 等，重名模型在桥内显示为 `<provider>/<model>`，可见模型合计限 100。上游 Key 只写入私有 CCR 配置，`connection.json` 仍保持原格式；`openai-bridge status` 会列出上游名称、地址和模型 ID，不打印 Key。当前 App 的图形表单仍只编辑第一个 endpoint，但再次保存会保留附加上游；图形模型清单也只查询主 endpoint，不会把一家 Key 发给另一家。已有安装要新增上游，先按原有重配流程确认停用/备份并留档旧实例，再重新 `configure`；不要直接覆盖现有私有配置。
+需要多个 OpenAI 兼容上游时，同一个 `configure` 会继续询问是否再添加一个 API；非交互安装也可在私有 `--config` JSON 里加可选 `providers` 数组（顶层仍是第一个上游）。配套 App 通过 `capabilities.multiUpstream` 识别新增/编辑/移除 API 的能力，各 API 独立保存地址/Key/模型；模型清单只查当前选中的 API。名称和 origin 同时匹配才允许复用留空 Key；不把一家 Key 发给另一家。旧 App 的单地址表单仍可用，保存保留附加上游。重名模型使用稳定 `<provider>/<model>` 别名，可见模型总数限100，上游数限16；每模型窗口仍由 App 存储。
+
+已有实例可以在线管理，不需要卸载或手改私有运行配置。先确认没有请求运行，由用户自己填写0600私有 JSON（endpoint、apiKey、model、可选 models/name），再执行：
+
+```sh
+openai-bridge add-provider --config /absolute/private/provider.json --yes
+openai-bridge edit-provider --provider relay-2 --config /absolute/private/provider.json --yes
+openai-bridge remove-provider --provider relay-2 --yes
+```
+
+操作会停止/重启同一已验证桥实例，保留本地密钥、注册和恢复锁；不能移除最后一个 API。随后在 App 配置页保存/同步模型清单，不切当前会话。不要由 AI 读取/检查/打印私有 JSON 或真实 Key。`openai-bridge status` 只列上游名称、地址和模型 ID；`connection.json` 仍保持本地认证格式。
 
 已获用户授权后，AI 可非交互启动、查看状态（输出不含密钥）：
 

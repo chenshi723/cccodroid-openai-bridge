@@ -508,6 +508,30 @@ const SIG_V1_FRAGMENTS = [
    `        return saved && saved.model === model && (saved.provider === undefined || provider === undefined || saved.provider === provider) ? sign(call, saved.signature) : call;`]
 ];
 
+// 15) tool_call id 并不跨会话唯一；缓存必须同时绑定会话、上游、模型。
+//     缺少可信请求作用域时不缓存/复用，Gemini 仍走原有占位回退。
+const SIG_SCOPE_MARK = "// ccr-thought-signature-scope-v3";
+const SIG_SCOPE_EDITS = [
+  [`      let sigs = globalThis.__ccrThoughtSigs || (globalThis.__ccrThoughtSigs = new Map());
+      sigs.delete(id);
+      sigs.set(id, { model: t?.req?.__ccrUpstreamModel, provider: t?.req?.__ccrUpstreamProvider, signature });`,
+   `      // ccr-thought-signature-scope-v3: isolate concurrent conversations and upstreams
+      let scope = t?.req?.__ccrSignatureScope;
+      if (!scope || id.length > 1024) return;
+      let key = JSON.stringify([scope, id]);
+      let sigs = globalThis.__ccrThoughtSigs || (globalThis.__ccrThoughtSigs = new Map());
+      sigs.delete(key);
+      sigs.set(key, { model: t?.req?.__ccrUpstreamModel, provider: t?.req?.__ccrUpstreamProvider, signature });`],
+  [`    let provider = o?.req?.__ccrUpstreamProvider;`,
+   `    let provider = o?.req?.__ccrUpstreamProvider, session = o?.req?.sessionId;
+    let scope = typeof provider === "string" && provider && typeof session === "string" && session && session.length <= 256 && typeof model === "string" ? JSON.stringify([session, provider, model]) : null;
+    if (o?.req) o.req.__ccrSignatureScope = scope;`],
+  [`        let saved = !has(call) && typeof call?.id === "string" && sigs?.get(call.id);
+        return saved && saved.model === model && (saved.provider === undefined || provider === undefined || saved.provider === provider) ? sign(call, saved.signature) : call;`,
+   `        let saved = scope && !has(call) && typeof call?.id === "string" && sigs?.get(JSON.stringify([scope, call.id]));
+        return saved && saved.model === model && saved.provider === provider ? sign(call, saved.signature) : call;`]
+];
+
 let src = fs.readFileSync(file, "utf8");
 let changed = false, missing = [];
 
@@ -558,6 +582,15 @@ if (!src.includes(SIG_MARK)) {
       for (const [oldText, newText] of SIG_EDITS) src = src.replace(oldText, () => newText);
       changed = true;
     }
+  }
+}
+
+if (!src.includes(SIG_SCOPE_MARK)) {
+  const bad = SIG_SCOPE_EDITS.filter(([oldText]) => src.split(oldText).length !== 2);
+  if (bad.length) missing.push("thought signature scope (anchors missing or not unique)");
+  else {
+    for (const [oldText, newText] of SIG_SCOPE_EDITS) src = src.replace(oldText, () => newText);
+    changed = true;
   }
 }
 
