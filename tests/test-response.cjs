@@ -94,7 +94,7 @@ function sse(frames, newline = "\n", done = true, multiline = false) {
   return frames.map((frame) => "event: completion" + newline + JSON.stringify(frame, null, multiline ? 2 : 0).split("\n").map((line) => "data: " + line).join(newline) + newline + newline).join("") + (done ? "data: [DONE]" + newline + newline : "");
 }
 
-const context = (stream) => ({ req: { id: "regression", body: stream === undefined ? {} : { stream } } });
+const context = (stream) => ({ req: { id: "regression", provider: "relay", sessionId: "fixture-session", body: stream === undefined ? {} : { stream } } });
 const usage = { prompt_tokens: 17, completion_tokens: 7, prompt_tokens_details: { cached_tokens: 5 } };
 const expectedUsage = { input_tokens: 12, output_tokens: 7, cache_read_input_tokens: 5 };
 const completion = (message = { role: "assistant", content: "正文 你好🙂\n第二行" }, reason = "stop") => ({
@@ -168,9 +168,10 @@ async function main() {
   const patch = fs.readFileSync(patchFile, "utf8");
   // 取补丁的纯字符串常量用于在临时副本还原原版/上一版，不执行补丁的文件 I/O 部分。
   const names = ["EFF", "UE", "UR", "READER", "CANCEL", "H", "BODY", "AGENT", "STREAM", "TOOL_IMAGES", "IMAGE_TOKENS", "REASON", "MODEL_ROUTE"];
-  const keys = names.flatMap((name) => [name + "_OLD", name + "_NEW"]).concat(["SSE_OLD", "SSE_NEW", "SSE_FALLBACK", "SSE_MARK", "SIG_MARK", "SIG_EDITS"]);
+  const keys = names.flatMap((name) => [name + "_OLD", name + "_NEW"]).concat(["SSE_OLD", "SSE_NEW", "SSE_FALLBACK", "SSE_MARK", "SIG_MARK", "SIG_EDITS", "MODEL_ROUTE_V1", "SIG_V1_FRAGMENTS", "SIG_SCOPE_EDITS"]);
   const constants = vm.runInNewContext(patch.slice(patch.indexOf("const EFF_OLD"), patch.indexOf("\nlet src =")) + "\n({" + keys.join(",") + "});");
   let original = fs.readFileSync(cliFile, "utf8");
+  for (const [oldText, newText] of [...constants.SIG_SCOPE_EDITS].reverse()) original = original.replace(newText, oldText);
   for (const [oldText, newText] of [...constants.SIG_EDITS].reverse()) original = original.replace(newText, oldText);
   original = original.replace(constants.SSE_NEW, constants.SSE_OLD).replace(constants.SSE_FALLBACK, constants.SSE_OLD);
   for (const name of names) original = original.replace(constants[name + "_NEW"], constants[name + "_OLD"]);
@@ -179,10 +180,11 @@ async function main() {
   for (const name of names) legacy = legacy.replace(constants[name + "_OLD"], constants[name + "_NEW"]);
   legacy = legacy.replace(constants.SSE_OLD, constants.SSE_FALLBACK);
   let patched;
-  const signedSse = constants.SIG_EDITS.slice(0, 4).reduce((text, [oldText, newText]) => {
+  const signatureScope = text => constants.SIG_SCOPE_EDITS.reduce((source,[oldText,newText])=>source.replace(oldText,()=>newText),text);
+  const signedSse = signatureScope(constants.SIG_EDITS.slice(0, 4).reduce((text, [oldText, newText]) => {
     assert.equal(text.split(oldText).length, 2, "Thought signature anchor inside SSE_NEW");
     return text.replace(oldText, () => newText);
-  }, constants.SSE_NEW);
+  }, constants.SSE_NEW));
 
   const preImages = legacy.replace(constants.SSE_FALLBACK, constants.SSE_NEW).replace(constants.TOOL_IMAGES_NEW, constants.TOOL_IMAGES_OLD).replace(constants.IMAGE_TOKENS_NEW, constants.IMAGE_TOKENS_OLD);
   const preMultiModel = legacy.replace(constants.SSE_FALLBACK, constants.SSE_NEW).replace(constants.MODEL_ROUTE_NEW, constants.MODEL_ROUTE_OLD);
@@ -197,7 +199,7 @@ async function main() {
       const result = fs.readFileSync(copy.cli, "utf8");
       for (const key of names.map((entry) => entry + "_NEW")) assert.ok(result.includes(constants[key]), "Preserved patch: " + key);
       assert.ok(result.includes(signedSse), "Preserved patch: SSE_NEW + thought signature");
-      assert.ok(result.includes(constants.SIG_EDITS[4][1]), "Preserved patch: thought signature request");
+      assert.ok(result.includes(signatureScope(constants.SIG_EDITS[4][1])), "Preserved patch: scoped thought signature request");
       apply(copy, 0);
       assert.equal(fs.statSync(copy.cli).ino, after.ino);
       assert.equal(fs.readFileSync(copy.cli, "utf8"), result);
@@ -316,7 +318,8 @@ async function main() {
     return vm.runInNewContext(source.slice(start,end)+'\ngetUseModel;', {getProjectSpecificRouter:async()=>undefined});
   }
   await test('Actual unpatched CCR overrides bare non-default IDs; patched CCR preserves configured session selections', async () => {
-    const config = {Providers:[{name:'relay',models:['test-default','test-second','claude-haiku-explicit','Org/Model-X']}],Router:{default:'relay,test-default',think:'relay,test-default',background:'relay,test-default',longContext:'relay,test-default',webSearch:'relay,test-default',longContextThreshold:60000}};
+    const provider=(name,models)=>({name,api_base_url:`https://${name}.invalid/v1/chat/completions`,api_key:`fixture-${name}`,models});
+    const config = {Providers:[provider('relay',['test-default','test-second','claude-haiku-explicit','Org/Model-X'])],Router:{default:'relay,test-default',think:'relay,test-default',background:'relay,test-default',longContext:'relay,test-default',webSearch:'relay,test-default',longContextThreshold:60000}};
     const request = (model,extra={}) => ({body:{model,...extra},log:{info(){}}});
     const before = actualModelRouter(original),after = actualModelRouter(patched);
     assert.equal(await before(request('test-second'),1,config),config.Router.default,'unpatched negative control');
@@ -328,7 +331,34 @@ async function main() {
     for(const id of ['unconfigured-model','test-SECOND','org/model-x','claude-haiku-alias'])assert.equal(await after(request(id),1,config),config.Router.default);
     assert.equal(await after(request('relay,test-second'),1,config),'relay,test-second','explicit legacy routing remains supported');
     assert.equal(await after(request('other,test-second'),1,config),'other,test-second','patch never fabricates a relay match from a comma route');
-    assert.equal(await after(request('test-second'),1,{...config,Providers:[{name:'not-relay',models:['test-second']}]}),config.Router.default,'only this component relay is affected');
+    assert.equal(await after(request('test-second'),1,{...config,Providers:[provider('not-relay',['test-second'])]}),'not-relay,test-second','a single usable provider can declare a bare ID');
+    const multi={Providers:[provider('relay',['test-default','shared']),provider('backup',['backup-model','shared'])],Router:config.Router,
+      MODEL_ROUTES:{'test-default':'relay,test-default','backup-model':'backup,backup-model','backup/shared':'backup,shared','shared':'relay,shared'}};
+    assert.equal(await after(request('backup-model'),1,multi),'backup,backup-model','MODEL_ROUTES selects the second upstream');
+    assert.equal(await after(request('backup-model',{thinking:{type:'adaptive'}}),100000,multi,{input_tokens:100000}),'backup,backup-model','mapping wins over think/long-context fallbacks');
+    assert.equal(await after(request('backup/shared'),1,multi),'backup,shared','duplicate upstream IDs use the exposed alias');
+    assert.equal(await after(request('shared'),1,multi),'relay,shared','bare duplicate IDs follow the explicit map');
+    assert.equal(await after(request('shared'),1,{...multi,MODEL_ROUTES:{}}),config.Router.default,'ambiguous duplicates fall back instead of guessing');
+    assert.equal(await after(request('test-default'),1,{...multi,MODEL_ROUTES:{'test-default':'missing,model'}}),config.Router.default,'invalid mapping targets fall through');
+    assert.equal(await after(request('relay,test-default'),1,multi),'relay,test-default','explicit routes are untouched while MODEL_ROUTES is active');
+  });
+  await test('A v1 model-route and signature patch upgrades in place to provider-scoped v2', () => {
+    let v1 = [...constants.SIG_SCOPE_EDITS].reverse().reduce((text,[oldText,newText])=>text.replace(newText,()=>oldText),patched)
+      .replace(constants.MODEL_ROUTE_NEW, constants.MODEL_ROUTE_V1)
+      .split('// ccr-thought-signature-v2').join('// ccr-thought-signature-v1');
+    for (const [oldText, newText] of constants.SIG_V1_FRAGMENTS) v1 = v1.replace(newText, oldText);
+    assert.ok(v1.includes('// ccr-relay-model-route-v1:') && v1.includes('// ccr-thought-signature-v1'));
+    const copy = fixture('v1-upgrade', v1);
+    apply(copy, 2);
+    assert.equal(fs.readFileSync(copy.cli, 'utf8'), patched);
+    assert.ok(!fs.readFileSync(copy.cli, 'utf8').includes('// ccr-thought-signature-v1'));
+    apply(copy, 0);
+    noTemps(copy);
+  });
+  await test('An existing v2 signature bundle upgrades to session-scoped caching idempotently',()=>{
+    const v2=[...constants.SIG_SCOPE_EDITS].reverse().reduce((text,[oldText,newText])=>text.replace(newText,()=>oldText),patched);
+    const copy=fixture('v2-scope-upgrade',v2);apply(copy,2);
+    assert.equal(fs.readFileSync(copy.cli,'utf8'),patched);apply(copy,0);noTemps(copy);
   });
   await test('An unknown CCR model-route anchor fails closed before any bundle write', () => {
     const source = original.replace(constants.MODEL_ROUTE_OLD,constants.MODEL_ROUTE_OLD.replace('config.Router','config.UnexpectedRouter'));
@@ -690,7 +720,7 @@ async function main() {
   // 签名记在 transformer 所在的全局里，请求侧回填也读同一个全局：两段实际发布代码放进同一个 vm 上下文。
   function signatureHarness() {
     const start = patched.indexOf("var Vf = "), end = patched.indexOf("\n};\nvar Cn =", start);
-    const reqStart = patched.indexOf("  // ccr-thought-signature-v1: return"), reqEnd = patched.indexOf("\n  let u, f = AbortSignal.timeout", reqStart);
+    const reqStart = patched.indexOf("  // ccr-thought-signature-v2: return"), reqEnd = patched.indexOf("\n  let u, f = AbortSignal.timeout", reqStart);
     assert.ok(start > 0 && end > start && reqStart > 0 && reqEnd > reqStart, "actual published thought-signature boundaries");
     const sandbox = vm.createContext({
       Response, ReadableStream, TextEncoder, TextDecoder, Error, TypeError, console,
@@ -701,8 +731,10 @@ async function main() {
     const Transformer = vm.runInContext(patched.slice(start, end + 4) + "\nbo;", sandbox);
     const transformer = new Transformer();
     transformer.logger = { debug() {}, error() {} };
-    const outgoing = vm.runInContext("((e, o) => {\n" + patched.slice(reqStart, reqEnd) + "\n  return e;\n})", sandbox);
-    return { transformer, outgoing, sigs: () => vm.runInContext("globalThis.__ccrThoughtSigs", sandbox) };
+    const send = vm.runInContext("((e, o) => {\n" + patched.slice(reqStart, reqEnd) + "\n  return e;\n})", sandbox);
+    const outgoing=(body,context)=>{for(const [key,value] of Object.entries({provider:'relay',sessionId:'fixture-session'}))if(!Object.hasOwn(context.req,key))context.req[key]=value;return send(body,context);};
+    const cacheKey=(id,session='fixture-session',provider='relay',model='gemini-3-pro')=>JSON.stringify([JSON.stringify([session,provider,model]),id]);
+    return { transformer, outgoing, cacheKey, sigs: () => vm.runInContext("globalThis.__ccrThoughtSigs", sandbox) };
   }
   const signed = (signature) => ({ google: { thought_signature: signature } });
   const assistantCalls = (body) => plain(body).messages.filter((message) => message.role === "assistant").map((message) => message.tool_calls);
@@ -734,6 +766,31 @@ async function main() {
     assert.deepEqual(other[0].extra_content, signed("skip_thought_signature_validator"), "another Gemini model never receives a foreign signature");
   });
 
+  await test("Remembered Gemini signatures are scoped to the same upstream provider", async () => {
+    const { transformer: tf, outgoing } = signatureHarness(), ctx = client(true), model = "gemini-3-pro-preview";
+    ctx.req.provider = "relay";
+    outgoing({ model, messages: [] }, ctx);
+    const frames = [
+      chunk({ tool_calls: [{ index: 0, id: "call_p", type: "function", function: { name: "Read", arguments: "{}" }, extra_content: signed("SIG_P") }] }),
+      chunk({}, "tool_calls"), { choices: [], usage }
+    ];
+    await events(await tf.transformResponseIn(upstream(sse(frames), "text/event-stream").response, ctx));
+    const history = [{ role: "assistant", content: "", tool_calls: [{ id: "call_p", type: "function", function: { name: "Read", arguments: "{}" } }] }];
+    assert.deepEqual(assistantCalls(outgoing({ model, messages: history }, { req: { provider: "backup" } }))[0][0].extra_content, signed("skip_thought_signature_validator"), "a different provider never receives the signature");
+    assert.deepEqual(assistantCalls(outgoing({ model, messages: history }, { req: { provider: "relay" } }))[0][0].extra_content, signed("SIG_P"));
+  });
+  await test('Repeated tool IDs are isolated across sessions and missing identity uses only fallback',async()=>{
+    const {transformer:tf,outgoing}=signatureHarness(),model='gemini-3-pro';
+    const call={id:'call_0',type:'function',function:{name:'Read',arguments:'{}'}};
+    for(const [session,signature] of [['session-a','SIG_A'],['session-b','SIG_B']]){
+      const ctx=client(false);ctx.req.sessionId=session;outgoing({model,messages:[]},ctx);
+      const value=completion({role:'assistant',content:null,tool_calls:[{...call,extra_content:signed(signature)}]},'tool_calls');
+      await (await tf.transformResponseIn(upstream(JSON.stringify(value)).response,ctx)).json();
+    }
+    const body={model,messages:[{role:'assistant',content:'',tool_calls:[call]}]};
+    for(const [session,signature] of [['session-a','SIG_A'],['session-b','SIG_B']])assert.deepEqual(assistantCalls(outgoing(body,{req:{provider:'relay',sessionId:session}}))[0][0].extra_content,signed(signature));
+    for(const req of [{provider:undefined,sessionId:'session-a'},{provider:'relay',sessionId:undefined},{provider:'backup',sessionId:'session-a'}])assert.deepEqual(assistantCalls(outgoing(body,{req}))[0][0].extra_content,signed('skip_thought_signature_validator'));
+  });
   for (const stream of [false, true]) {
     await test("Gemini JSON tool-call signature round trip without leaking into Anthropic output, stream=" + stream, async () => {
       const { transformer: tf, outgoing } = signatureHarness(), ctx = client(stream), model = "gemini-3-flash-preview";
@@ -768,8 +825,10 @@ async function main() {
     assert.ok(start > 0 && end > start, "actual published Gf boundaries");
     const requests = [], sandbox = vm.createContext({ Headers, AbortSignal, AbortController, URL, Response, Set, JSON, import_undici: { Agent: class {}, ProxyAgent: class {} } });
     sandbox.fetch = async (url, options) => { requests.push(JSON.parse(options.body)); return new Response(requests.length === 1 ? "Invalid request payload" : "ok", { status: requests.length === 1 ? 400 : 200 }); };
-    vm.runInContext("globalThis.__ccrThoughtSigs = new Map([['call_r', { model: 'gemini-3-pro', signature: 'SIG_R' }]]);", sandbox);
-    const Gf = vm.runInContext(patched.slice(start, end) + "\nGf;", sandbox), req = { id: "retry" };
+    const scope=JSON.stringify(['fixture-session','relay','gemini-3-pro']),key=JSON.stringify([scope,'call_r']);
+    sandbox.signatureKey=key;
+    vm.runInContext("globalThis.__ccrThoughtSigs = new Map([[signatureKey, { model: 'gemini-3-pro', provider:'relay', signature: 'SIG_R' }]]);", sandbox);
+    const Gf = vm.runInContext(patched.slice(start, end) + "\nGf;", sandbox), req = { id: "retry",provider:'relay',sessionId:'fixture-session' };
     const body = { model: "gemini-3-pro", reasoning_effort: "high", messages: [{ role: "assistant", content: "", tool_calls: [{ id: "call_r", type: "function", function: { name: "Read", arguments: "{}" } }] }] };
     const response = await Gf("https://fixture.invalid/v1/chat/completions", body, {}, { debug() {}, warn() {} }, { req });
     assert.equal(await response.text(), "ok");
@@ -799,7 +858,7 @@ async function main() {
   });
 
   await test("Remembered signatures are bounded, typed and size-limited", async () => {
-    const { transformer: tf, outgoing, sigs } = signatureHarness(), ctx = client(false);
+    const { transformer: tf, outgoing, sigs, cacheKey } = signatureHarness(), ctx = client(false);
     outgoing({ model: "gemini-3-pro", messages: [] }, ctx);
     const respond = async (id, signature) => {
       const value = completion({ role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: "Read", arguments: "{}" }, extra_content: { google: { thought_signature: signature } } }] }, "tool_calls");
@@ -811,9 +870,9 @@ async function main() {
     assert.equal(sigs(), undefined);
     for (let i = 0; i < 1030; i++) await respond("call_" + i, "SIG_" + i);
     assert.equal(sigs().size, 1024);
-    assert.equal(sigs().has("call_5"), false);
-    assert.equal(sigs().get("call_6").signature, "SIG_6");
-    assert.equal(sigs().get("call_1029").model, "gemini-3-pro");
+    assert.equal(sigs().has(cacheKey('call_5')), false);
+    assert.equal(sigs().get(cacheKey('call_6')).signature, "SIG_6");
+    assert.equal(sigs().get(cacheKey('call_1029')).model, "gemini-3-pro");
   });
 
   await test("Missing or duplicated thought-signature anchors fail closed before any bundle write", () => {

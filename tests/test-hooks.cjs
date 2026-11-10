@@ -264,7 +264,8 @@ watchdog_healthy && exit 13
   await test('persistent crashes exhaust a durable budget and Hook cannot rearm',async f=>{
     fs.writeFileSync(f.cli,"const fs=require('node:fs'),path=require('node:path');fs.appendFileSync(path.join(process.env.HOME,'.claude-code-router','fake-starts'),'start\\n');process.exitCode=1;\n");
     assert.equal((await f.hook()).status,0);
-    await until(()=>fs.existsSync(path.join(f.state,'recovery.failed')),'durable recovery failure');
+    // 三次独立Node启动在手机调度下可能超过5秒；仍严格断言只消费三次预算。
+    await until(()=>fs.existsSync(path.join(f.state,'recovery.failed')),'durable recovery failure',15000);
     await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'watchdog stopped at limit');
     assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim().split('\n').length,3);
     assert.equal((await f.hook()).status,0);await sleep(500);
@@ -287,7 +288,7 @@ watchdog_healthy && exit 13
   await test('persistent patch errors also exhaust the durable budget',async f=>{
     fs.writeFileSync(path.join(f.dir,'patch-ccr.js'),"const fs=require('node:fs');fs.appendFileSync(__dirname+'/patch-runs','patch\\n');process.exitCode=1;\n");
     assert.equal((await f.hook()).status,0);
-    await until(()=>fs.existsSync(path.join(f.state,'recovery.failed')),'patch failure budget');
+    await until(()=>fs.existsSync(path.join(f.state,'recovery.failed')),'patch failure budget',15000);
     await until(()=>!f.alive('watchdog.pid',path.join(f.dir,'watchdog.sh')),'watchdog stopped after patch failures');
     assert.equal(fs.readFileSync(path.join(f.dir,'patch-runs'),'utf8').trim().split('\n').length,3);
     assert.equal(fs.existsSync(path.join(f.state,'fake-starts')),false);

@@ -50,10 +50,116 @@ function deny(f,body,code='RUNTIME_CONFLICT',options={}){
 }
 function config(f){return JSON.parse(fs.readFileSync(path.join(f.target,'runtime-home/.claude-code-router/config.json'),'utf8'));}
 function write(file,value){fs.writeFileSync(file,JSON.stringify(value,null,2)+'\n',{mode:0o600});}
+function installMulti(f){
+  const {value}=saved(f);
+  const connectionFile=path.join(f.target,'connection.json'),configFile=path.join(f.target,'runtime-home/.claude-code-router/config.json');
+  const connection=JSON.parse(fs.readFileSync(connectionFile)),port=Number(new URL(connection.baseUrl).port);
+  const secondary={endpoint:'https://secondary.example.invalid/v1/chat/completions',apiKey:'secondary-key',model:'secondary-model',models:['secondary-model','shared-model']};
+  const multi=api.validateConfig({...input,endpoint:value.endpoint,models:[input.model,'primary-two'],providers:[secondary]},port);
+  write(configFile,api.routerConfig(multi,port,connection.apiKey));
+  write(connectionFile,api.connectionConfig(multi,connection.baseUrl,connection.apiKey));
+  return {connectionFile,configFile,connection,port,secondary,multi,primaryEndpoint:value.endpoint};
+}
+
+function upstreamRequest(upstreams,model=upstreams[0].models[0].id){
+  return {endpoint:upstreams[0].endpoint,apiKey:'',model,models:upstreams.flatMap(upstream=>upstream.models.map(item=>item.id)),upstreams};
+}
+const firstUpstream=()=>({name:'relay',endpoint:input.endpoint,apiKey:upstreamKey,models:[{id:input.model}]});
+const secondUpstream=()=>({name:'relay-2',endpoint:'https://secondary.example.invalid/v1',apiKey:'secondary-key',models:[{id:'secondary-model'},{id:'relay-2/'+input.model,model:input.model}]});
+
+test('full upstream save adds, edits and removes APIs online without changing local identity',()=>fixture(f=>{
+  const first=firstUpstream(),second=secondUpstream(),body=upstreamRequest([first,second]);
+  const {value,r}=saved(f,body),local=JSON.parse(fs.readFileSync(path.join(f.target,'connection.json'))),registry=fs.readFileSync(f.registry);
+  assert.equal(value.capabilities.multiUpstream,true);assert.equal(value.upstreams.length,2);
+  assert.deepEqual(value.models,body.models);assert(!r.stdout.includes('secondary-key'));assert(!r.stdout.includes(local.apiKey));
+  const keyless=value.upstreams.map(({hasKey,...upstream})=>({...upstream,apiKey:''}));
+  keyless[1].endpoint='https://secondary.example.invalid/tenant/chat/completions';
+  const edited=saved(f,upstreamRequest(keyless,'secondary-model')).value;
+  assert.equal(config(f).Providers[1].api_key,'secondary-key');assert.equal(config(f).Providers[1].api_base_url,keyless[1].endpoint);
+  assert.equal(config(f).Router.default,'relay-2,secondary-model');
+  const only=edited.upstreams[1];
+  const removed=saved(f,upstreamRequest([{name:only.name,endpoint:only.endpoint,apiKey:'',models:only.models}],only.models[1].id)).value;
+  assert.equal(config(f).Providers.length,1);assert.equal(config(f).Providers[0].name,'relay-2');
+  assert.equal(config(f).Router.default,'relay-2,'+input.model);assert.deepEqual(removed.models,['secondary-model','relay-2/'+input.model]);
+  assert.deepEqual(fs.readFileSync(f.registry),registry);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.target,'connection.json'))).apiKey,local.apiKey);
+  const before=snapshot(f.home);saved(f,upstreamRequest([{name:only.name,endpoint:only.endpoint,apiKey:'',models:only.models}],only.models[1].id));
+  const after=snapshot(f.home);delete before['.local/share/ccr-bridge-kit/start-called'];delete after['.local/share/ccr-bridge-kit/start-called'];assert.deepEqual(after,before);
+}));
+
+test('blank upstream keys are bound to both name and origin, including same-origin accounts',()=>fixture(f=>{
+  const second={...secondUpstream(),endpoint:input.endpoint,apiKey:'second-account-key'};
+  const status=saved(f,upstreamRequest([firstUpstream(),second])).value;
+  const blank=status.upstreams.map(({hasKey,...upstream})=>({...upstream,apiKey:''}));
+  saved(f,upstreamRequest(blank));assert.equal(config(f).Providers[0].api_key,upstreamKey);assert.equal(config(f).Providers[1].api_key,'second-account-key');
+  deny(f,upstreamRequest(blank.map((upstream,i)=>i?{...upstream,name:'new-name'}:upstream)),'KEY_REQUIRED');
+  deny(f,upstreamRequest(blank.map((upstream,i)=>i?{...upstream,endpoint:'https://changed.example.invalid/v1'}:upstream)),'KEY_HOST_CHANGED');
+}));
+
+test('full upstream topology rejects duplicates, malformed pairs and payloads before writes',()=>fixture(f=>{
+  const body=upstreamRequest([firstUpstream(),secondUpstream()]);
+  for(const change of [
+    value=>value.upstreams.push({...value.upstreams[1]}),
+    value=>value.upstreams[1].models[0].id=input.model,
+    value=>value.upstreams[1].models[1].model='secondary-model',
+    value=>value.upstreams[0].models=[],
+    value=>value.upstreams[1].name='bad,name',
+    value=>value.upstreams[1].apiKey='bad key',
+    value=>value.upstreams[1].extra=true,
+    value=>value.upstreams[1].models[0].extra=true,
+    value=>value.upstreams[1].endpoint='http://remote.invalid/v1',
+    value=>value.endpoint='https://different.invalid/v1',
+    value=>value.models=[input.model],
+    value=>value.apiKey='ambiguous-top-level-key',
+    value=>value.model='missing'
+  ]){const value=structuredClone(body);change(value);deny(f,value,'INVALID_INPUT');}
+}));
+
+for(const phase of ['config','connection'])test('interrupted full upstream replacement resumes after '+phase+' rename',()=>fixture(f=>{
+  saved(f,upstreamRequest([firstUpstream(),secondUpstream()]));
+  const hook=path.join(f.root,'upstream-crash.cjs'),file=path.join(f.target,phase==='config'?'runtime-home/.claude-code-router/config.json':'connection.json');
+  fs.writeFileSync(hook,`const fs=require('node:fs'),rename=fs.renameSync;fs.renameSync=function(from,to){const value=rename.apply(this,arguments);if(to===${JSON.stringify(file)})process.kill(process.pid,'SIGKILL');return value;};`);
+  const body=upstreamRequest([{...secondUpstream(),apiKey:'',models:[{id:'secondary-model'}]}],'secondary-model');
+  const crashed=f.run('gui-configure',body,{env:{NODE_OPTIONS:'--require='+hook}});assert.notEqual(crashed.status,0);
+  assert.equal(fs.readFileSync(path.join(f.target,'disabled'),'utf8'),'configuring\n');
+  const before=snapshot(f.home),status=result(f.run('gui-status'));assert.equal(status.localError,'COMPONENT_DISABLED');assert.deepEqual(snapshot(f.home),before);
+  const resumed=saved(f,body).value;assert.deepEqual(resumed.models,['secondary-model']);assert.equal(config(f).Providers[0].api_key,'secondary-key');assert.equal(fs.existsSync(path.join(f.target,'disabled')),false);
+}));
+
+test('interrupted removal of secondary API resumes back to canonical legacy single-provider format',()=>fixture(f=>{
+  saved(f,upstreamRequest([firstUpstream(),secondUpstream()],'secondary-model'));
+  const file=path.join(f.target,'runtime-home/.claude-code-router/config.json'),hook=path.join(f.root,'remove-secondary-crash.cjs');
+  fs.writeFileSync(hook,`const fs=require('node:fs'),rename=fs.renameSync;fs.renameSync=function(from,to){const value=rename.apply(this,arguments);if(to===${JSON.stringify(file)})process.kill(process.pid,'SIGKILL');return value;};`);
+  const body=upstreamRequest([{...firstUpstream(),apiKey:''}]);
+  assert.notEqual(f.run('gui-configure',body,{env:{NODE_OPTIONS:'--require='+hook}}).status,0);
+  const status=result(f.run('gui-status'));assert.equal(status.localError,'COMPONENT_DISABLED');assert.equal(status.model,'secondary-model');
+  const resumed=saved(f,body).value;assert.equal(resumed.model,input.model);assert.equal(config(f).Providers.length,1);assert.equal(Object.hasOwn(config(f),'MODEL_ROUTES'),false);
+}));
+
+test('model discovery reuses only the selected saved API key and never fans it out',()=>fixture(f=>{
+  const status=saved(f,upstreamRequest([firstUpstream(),secondUpstream()])).value,before=snapshot(f.home);
+  const endpoint=status.upstreams[1].endpoint;
+  assert.equal(result(models(f,{endpoint,provider:'relay-2'}, {},'secondary-key')).models.length,1);
+  for(const [request,code] of [[{endpoint,provider:'missing'},'KEY_REQUIRED'],[{endpoint:input.endpoint,provider:'relay-2'},'KEY_HOST_CHANGED'],[{endpoint},'KEY_HOST_CHANGED']]){
+    const denied=models(f,request);assert.equal(denied.status,1);assert.equal(JSON.parse(denied.stderr).error.code,code);
+  }
+  assert.deepEqual(snapshot(f.home),before);
+}));
+
+test('CLI add/edit/remove provider uses fixed checked instance and private JSON without uninstall',()=>fixture(f=>{
+  saved(f);const file=path.join(f.root,'provider.private.json');write(file,{endpoint:secondUpstream().endpoint,apiKey:'secondary-key',model:'secondary-model'});
+  const run=(command,args)=>f.run(command,undefined,{args});
+  const before=snapshot(f.home);assert.equal(run('add-provider',['--config',file]).status,1);assert.deepEqual(snapshot(f.home),before);
+  let response=run('add-provider',['--config',file,'--yes']);assert.equal(response.status,0,response.stderr);assert.equal(config(f).Providers.length,2);assert(!response.stdout.includes('secondary-key'));
+  write(file,{endpoint:'https://secondary.example.invalid/new/chat/completions',model:'changed-secondary'});
+  response=run('edit-provider',['--provider','relay-2','--config',file,'--yes']);assert.equal(response.status,0,response.stderr);assert.equal(config(f).Providers[1].api_key,'secondary-key');assert.deepEqual(config(f).Providers[1].models,['changed-secondary']);
+  response=run('remove-provider',['--provider','relay','--yes']);assert.equal(response.status,0,response.stderr);assert.equal(config(f).Providers[0].name,'relay-2');
+  assert.equal(run('remove-provider',['--provider','relay-2','--yes']).status,1);
+}));
 
 test('GUI status without installation is nonsecret, read-only and never creates runtime',()=>fixture(f=>{
   const before=snapshot(f.home),r=f.run('gui-status'),v=result(r);
-  assert.deepEqual(v,{schema:1,id:'openai-bridge',configured:false,endpoint:'',model:'',models:[],hasKey:false,localReady:false});
+  assert.deepEqual(v,{schema:1,id:'openai-bridge',capabilities:{multiUpstream:true},configured:false,endpoint:'',model:'',models:[],hasKey:false,localReady:false});
   assert.deepEqual(snapshot(f.home),before);
 }));
 
@@ -97,6 +203,65 @@ test('GUI multi-model save/status persist only IDs, keep default routes and reta
   const last=saved(f,{...input,apiKey:'',model:'fixture-replacement',models:nextIds}).value;
   assert.equal(last.model,'fixture-replacement');assert.deepEqual(last.models,nextIds);assert.equal(config(f).Router.default,'relay,fixture-replacement');
 }));
+
+test('GUI preserves a CLI-added secondary upstream while the App edits the visible list',()=>fixture(f=>{
+  const {connectionFile,multi,primaryEndpoint}=installMulti(f),status=result(f.run('gui-status'));
+  assert.deepEqual(status.models,multi.models);assert.equal(status.endpoint,primaryEndpoint);assert.equal(status.model,input.model);
+  const edited=[input.model,'secondary-model','shared-model','new-model'],{r,value}=saved(f,{...input,apiKey:'',models:edited});
+  assert.deepEqual(value.models,edited);assert(!r.stdout.includes('secondary-key'));
+  const router=config(f);
+  assert.equal(router.Providers.length,2);
+  assert.deepEqual(router.Providers[0].models,[input.model,'new-model']);
+  assert.deepEqual(router.Providers[1].models,['secondary-model','shared-model']);
+  assert.equal(router.Providers[1].api_key,'secondary-key');
+  assert.deepEqual(router.MODEL_ROUTES,{[input.model]:'relay,'+input.model,'secondary-model':'relay-2,secondary-model','shared-model':'relay-2,shared-model','new-model':'relay,new-model'});
+  const connection=JSON.parse(fs.readFileSync(connectionFile));
+  assert.deepEqual(connection.models,edited);assert.equal(Object.hasOwn(connection,'providers'),false);
+}));
+
+test('GUI can make a secondary model the default without dropping its provider',()=>fixture(f=>{
+  const {connectionFile,multi}=installMulti(f),{value}=saved(f,{...input,apiKey:'',model:'secondary-model',models:multi.models});
+  assert.equal(value.model,'secondary-model');assert.deepEqual(value.models,multi.models);
+  const router=config(f);
+  for(const name of ['default','background','think','longContext','webSearch'])assert.equal(router.Router[name],'relay-2,secondary-model');
+  assert.equal(JSON.parse(fs.readFileSync(connectionFile)).model,'secondary-model');
+  assert.equal(result(f.run('gui-status')).model,'secondary-model');
+}));
+
+test('multi-provider single-model saves are idempotent and keep secondary providers',()=>fixture(f=>{
+  installMulti(f);
+  const body={...input,apiKey:'',model:input.model};
+  saved(f,body);
+  const before=snapshot(f.home);
+  saved(f,body);
+  const after=snapshot(f.home);
+  delete before['.local/share/ccr-bridge-kit/start-called'];delete after['.local/share/ccr-bridge-kit/start-called'];
+  assert.deepEqual(after,before,'a repeated single-model save must not rewrite or stop the multi-provider runtime');
+  assert.equal(config(f).Providers.length,2);
+  assert.deepEqual(result(f.run('gui-status')).models,[input.model]);
+}));
+
+test('multi-provider status rejects noncanonical providers, routes and connection fields',()=>{
+  const connectionFile=f=>path.join(f.target,'connection.json'),configFile=f=>path.join(f.target,'runtime-home/.claude-code-router/config.json');
+  for(const mutate of [
+    f=>{const c=config(f);c.Providers[1].api_base_url='https://other.example.invalid/private';write(configFile(f),c);},
+    f=>{const c=config(f);c.Providers[1].models=c.Providers[1].models.filter(model=>model!=='shared-model');write(configFile(f),c);},
+    f=>{const c=config(f);c.MODEL_ROUTES['secondary-model']='relay,secondary-model';write(configFile(f),c);},
+    f=>{const c=config(f);c.MODEL_ROUTES.extra='relay,extra';write(configFile(f),c);},
+    f=>{const c=config(f);c.Providers[1].name='relay';write(configFile(f),c);},
+    f=>{const c=config(f);c.Providers[0].models=[input.model];write(configFile(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connectionFile(f)));c.models=[input.model];write(connectionFile(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connectionFile(f)));c.providers=[];write(connectionFile(f),c);},
+    f=>{const c=JSON.parse(fs.readFileSync(connectionFile(f)));c.apiKey='f'.repeat(48);write(connectionFile(f),c);}
+  ])fixture(f=>{
+    const {multi}=installMulti(f);mutate(f);
+    deny(f,{...input,apiKey:'',model:input.model,models:multi.models});
+    const before=snapshot(f.home),status=f.run('gui-status');
+    assert.equal(status.status,1,status.stdout+status.stderr);
+    assert.equal(JSON.parse(status.stderr).error.code,'RUNTIME_CONFLICT');
+    assert.deepEqual(snapshot(f.home),before);
+  });
+});
 
 test('legacy single-model instances can explicitly add models and old clients can save single-model format',()=>fixture(f=>{
   saved(f);const file=path.join(f.target,'connection.json');
@@ -149,7 +314,8 @@ test('regular CLI configure never marks a manual installation as GUI-managed or 
 
 test('GUI status exposes no old key or connection path and never starts/stops/writes',()=>fixture(f=>{
   saved(f);const before=snapshot(f.home),r=f.run('gui-status'),v=result(r),c=JSON.parse(fs.readFileSync(path.join(f.target,'connection.json')));
-  assert.deepEqual(v,{schema:1,id:'openai-bridge',configured:true,endpoint:'https://api.example.invalid/v1/chat/completions',model:input.model,models:[input.model],hasKey:true,localReady:false,localError:'LOCAL_START_FAILED'});
+  assert.deepEqual(v,{schema:1,id:'openai-bridge',capabilities:{multiUpstream:true},configured:true,endpoint:'https://api.example.invalid/v1/chat/completions',model:input.model,models:[input.model],
+    upstreams:[{name:'relay',endpoint:'https://api.example.invalid/v1/chat/completions',hasKey:true,models:[{id:input.model}]}],hasKey:true,localReady:false,localError:'LOCAL_START_FAILED'});
   assert(!r.stdout.includes(upstreamKey));assert(!r.stdout.includes(c.apiKey));assert(!('connectionPath'in v));
   assert.deepEqual(snapshot(f.home),before);
 }));
@@ -428,13 +594,13 @@ test('GUI ready status uses only validated literal loopback health and does not 
   const before=snapshot(f.home),status=result(f.run('gui-status',undefined,{env:{NODE_OPTIONS:'--require='+hook}}));assert.equal(status.localReady,true);assert.deepEqual(snapshot(f.home),before);assert(!r.stdout.includes(upstreamKey));
 }));
 
-function models(f,body,options={}){
+function models(f,body,options={},expectedKey=upstreamKey){
   // Test-only module stub: exercise the actual stdin/dispatch/old-key resolver without network.
   const hook=path.join(f.root,'models-stub.cjs');
   fs.writeFileSync(hook,`const Module=require('node:module'),load=Module._load;
 Module._load=function(name,parent){if(name==='./gui-models.cjs'&&parent.filename===${JSON.stringify(path.join(f.kit,'installer.cjs'))})return {async listModels(input,{resolveSavedKey}){
   const key=input.apiKey||await resolveSavedKey(input.endpoint);
-  if(key!==${JSON.stringify(upstreamKey)})throw Object.assign(new Error('must not echo '+key),{guiCode:'MODELS_AUTH'});
+  if(key!==${JSON.stringify(expectedKey)})throw Object.assign(new Error('must not echo '+key),{guiCode:'MODELS_AUTH'});
   return {schema:1,id:'openai-bridge',models:[{id:'fixture-listed-model'}],truncated:false};
 }};return load.apply(this,arguments);};`);
   return f.run('gui-models',body,{...options,env:{NODE_OPTIONS:'--require='+hook,...options.env}});

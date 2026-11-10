@@ -15,7 +15,7 @@
 - 这是默认源码策略，随受管组件更新部署后不需要每次启动传环境变量。不会清除旧版本已经写下的故障锁，也不会修改应用本体或安装信任根。**尚未发布、未做隔夜系统后台验收；不声称已证实历史第一次超时的系统原因。**
 
 
-> **基于正式 1.0.5-r14 的后续源码候选。** 已回迁 r10–r14 的 Android linker 识别、受管升级/卸载残留重配及 reasoning 参数降级修复；本次增加可选多模型、恢复状态一致性、HOME 别名管理和更新瞬态有限确认，尚未发布。 当前 App 的 HMAC 通道不能由旧 Hook 解码识别。本实现改为配置时显式注册不含密钥的本地端点，配套 App 在包装 URL 和启动 CLI 前调用固定组件入口并等待就绪，桥提供有限恢复和身份验证卸载。是否已经发布以 App / 组件各自正式发行记录为准；先发布兼容 App，再发布组件并由用户确认配置或迁移。用户另行授权的本地手工桥适配已报告“退出并重开 App 后仍可使用”；它不是本版本的正式签名安装，也没有验证真正 APK 升级。源码合入不能代替最终签名配套包的八项验收，单独更新组件不能修复旧 App。详见 [交付门槛](docs/DELIVERY-ACCEPTANCE.zh-CN.md)。
+> **基于正式 1.0.5-r14 的后续源码候选。** 已回迁 r10–r14 的 Android linker 识别、受管升级/卸载残留重配及 reasoning 参数降级修复；本次增加可选多模型、多个 OpenAI 兼容上游、恢复状态一致性、HOME 别名管理和更新瞬态有限确认，尚未发布。 当前 App 的 HMAC 通道不能由旧 Hook 解码识别。本实现改为配置时显式注册不含密钥的本地端点，配套 App 在包装 URL 和启动 CLI 前调用固定组件入口并等待就绪，桥提供有限恢复和身份验证卸载。是否已经发布以 App / 组件各自正式发行记录为准；先发布兼容 App，再发布组件并由用户确认配置或迁移。用户另行授权的本地手工桥适配已报告“退出并重开 App 后仍可使用”；它不是本版本的正式签名安装，也没有验证真正 APK 升级。源码合入不能代替最终签名配套包的八项验收，单独更新组件不能修复旧 App。详见 [交付门槛](docs/DELIVERY-ACCEPTANCE.zh-CN.md)。
 
 - 基于 MIT 许可的 `@musistudio/claude-code-router` **1.0.73**，固定依赖和完整性锁文件。
 - 含思考强度映射、上游取消、JSON/SSE 嗅探、工具图片处理、Gemini 3 工具调用签名回传、用量保留、原子补丁、单例启动及看护。
@@ -59,6 +59,25 @@
 - `gui-models` 的 schema 也仍为 **1**，清单项扩展为 `{id, context_window?}`。窗口只接受上游 `context_window` / `contextWindow` / `max_input_tokens` / `context_length` / `max_context_tokens` 中的 JSON 数字整数 **1024–16777216**（也支持 `top_provider` 对象下这些字段）；按上述字段顺序先查顶层、后查 `top_provider`，取第一个有效值。缺失、字符串、小数、越界值均省略，不把输出 `max_tokens` 当输入容量，也不伪造默认值。清单仍有 1 MiB 响应、128 KiB 结果、500 个唯一 ID、Key 回显过滤和 12 秒超时限制。
 - **配置 `models` 只包含 ID。** 每模型窗口由 App 独立存储；没有有效元数据时的 **200000** 默认值由 App 决定，不是组件声称的上游容量。读取清单和保存配置仍互相独立，不会调用真实模型。
 
+### 多个 OpenAI 兼容上游（源码候选）
+
+- 终端 `configure` 会在第一个 API 之后询问是否继续添加；非交互安装也可在私有 `--config` JSON 顶层增加可选 `providers` 数组。顶层 `endpoint`/`apiKey`/`model`/`models` 仍是第一个上游；每个附加项接受 `endpoint`、`apiKey`、`model`、可选 `models` 和可选 `name`。
+- 名称默认 `relay`、`relay-2`……，也可给 `name`（小写字母开头、1–32 位小写字母/数字/连字符，保留名 `relay` 只能给第一个上游）。模型 ID 全局唯一时直接暴露；重名时后出现的暴露为 `<provider>/<model>`，避免把请求发错上游。所有上游的可见模型合计仍限 1–100。
+- 私有 CCR 配置包含多个 `Providers` 和 `MODEL_ROUTES`（可见 ID → `provider,model`）；`connection.json` 仍保持 schema 1，只含本机地址、本地桥密钥、默认模型和可见模型列表。上游 Key 只存在私有 CCR 配置中（0600）；`openai-bridge status` 只列上游名称、地址和模型 ID，不打印 Key。
+- `gui-status` 通过 `capabilities.multiUpstream` 告知配套 App 能力，并返回不含密钥的 `upstreams:[{name,endpoint,hasKey,models:[{id,model?}]}]`。`model` 与可见 `id` 相同时可省略。配套 App 可一次提交完整 `upstreams` 新增、编辑或移除 API，无需卸载；旧单地址表单仍兼容，不会悄悄删掉附加上游。
+- `gui-configure` 完整拓扑的每一项只接受 `{name,endpoint,apiKey?,models:[{id,model?}]}`，顶层 `model` 指定全局默认可见 ID，顶层 `models` 必须与展开后的可见 ID 顺序一致。留空 Key 只复用**相同上游名称且同 origin**的已验证 Key；新增名称、改 origin 必须新填，删除主上游时保留剩余上游名称/模型别名。保存仍在共享锁内核对实例、原子提交两份配置，保留恢复故障和本地认证。
+- `gui-models` 新增可选 `provider` 指定当前 API，仅查询该 endpoint；留空 Key 按名称和 origin 核对，不会把 A 家 Key 发给 B 家，也不会向其他 API 自动发请求。旧 App 不传 `provider` 时只查主 endpoint。显式 `provider,model` 旧路由保持不变，未知 ID 继续走原 CCR 后备规则。
+
+已安装实例可用以下命令在线管理（先确认没有会话请求运行；私有 JSON 由用户填写，文件权限须为0600）：
+
+```sh
+openai-bridge add-provider --config /absolute/private/provider.json --yes
+openai-bridge edit-provider --provider relay-2 --config /absolute/private/provider.json --yes
+openai-bridge remove-provider --provider relay-2 --yes
+```
+
+新增/编辑 JSON 包含 `endpoint`、`apiKey`、`model`、可选 `models`/`name`，不是整个桥配置；编辑时 Key 留空可同名同源保留。命令不会自动更改 App 的接口清单，之后在配套 App 打开配置页保存/同步再新建会话。不能移除最后一个上游，不清恢复锁，不执行外来私有脚本。图形新增/删除入口需要同批配套 App，旧版会继续使用原单 API 表单。
+
 旧 App / 终端仍可用：用户自己运行 `openai-bridge configure`，输入完整 Chat Completions URL、自有 API Key、模型名并确认新增自己的 SessionStart Hook；`openai-bridge start` 等待本地就绪，`openai-bridge status` 查看不含密钥的状态。终端私有 JSON 也接受同样的可选 `models`。没有图形配置支持的 App 仍须在自定义接口中手工填写本机地址、模型和私有连接文件里的本地密钥。不要把远端 Key 当成本地 Key，不要把连接文件发给 AI 或公开。
 
 `openai-bridge --selftest` 只测试回环假上游，不需要账号或真实密钥、不消耗模型额度。
@@ -100,6 +119,7 @@ HOME 仅在信任根处 realpath 规范，再构造默认目录并传给子进�
 npm ci --ignore-scripts --omit=dev --no-audit --no-fund
 node tests/test-registration.cjs
 node tests/test-installer.cjs
+node tests/test-multi-provider.cjs
 node tests/test-uninstall-instance.cjs
 node tests/test-gui-config.cjs
 node tests/test-gui-models.cjs
@@ -120,7 +140,7 @@ node tests/audit-bundle.cjs
 
 ## 向组件市场同步
 
-先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（市场基线为 1.0.5-r17，本次候选为 1.0.5-r18；发布前再次核对市场最新 revision）。配方文案的最终版本以市场仓库 `greyoak111/cccodroid-components` 为准，本仓库 `recipe/` 与其保持一致，避免下次同步覆盖。
+先在本仓库改代码、测试，然后运行 `bash recipe/sync.sh <组件仓库绝对路径>`，在市场仓库执行 `node tools/check-recipes.mjs`、依赖解析和构建审计。任何配方/脚本/skill 修改都要增加 revision（市场基线为 1.0.5-r17，本次候选为 1.0.5-r19；发布前再次核对市场最新 revision）。配方文案的最终版本以市场仓库 `greyoak111/cccodroid-components` 为准，本仓库 `recipe/` 与其保持一致，避免下次同步覆盖。
 
 ## 许可与贡献
 

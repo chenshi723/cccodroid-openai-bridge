@@ -1,6 +1,15 @@
 {
   "endpoint": "https://api.example.com/v1/chat/completions",
   "apiKey": "REPLACE_WITH_YOUR_OWN_UPSTREAM_API_KEY",
-  "model": "REPLACE_WITH_YOUR_OWN_MODEL",
+  "model": "example-model",
+  "models": ["example-model", "example-model-mini"],
+  "providers": [
+    {
+      "endpoint": "https://api2.example.com/v1/chat/completions",
+      "apiKey": "REPLACE_WITH_YOUR_SECOND_UPSTREAM_API_KEY",
+      "model": "example-model-two",
+      "models": ["example-model-two"]
+    }
+  ],
   "port": 3459
 }

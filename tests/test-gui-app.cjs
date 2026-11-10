@@ -23,6 +23,7 @@ const record=path.join(root,'components/openai-bridge.json');fs.mkdirSync(path.d
 fs.writeFileSync(record,JSON.stringify({id:'openai-bridge',state:'ok',files:['lib/openai-bridge/component.cjs']}));
 const target=path.join(home,'.local/share/ccr-bridge-kit');
 const fakeKey='fixture-private-upstream-never-print';
+if(process.argv.includes('--multi-upstream'))env.OPENAI_BRIDGE_GUI_MULTI='1';
 let remoteConnections=0;
 const upstream=net.createServer(socket=>{remoteConnections++;socket.destroy();});
 function exec(args,options={}){
@@ -61,6 +62,30 @@ async function childTest(){
     assert.equal(provider.baseUrl,connection.baseUrl);assert.equal(provider.apiKey,connection.apiKey);assert.notEqual(provider.apiKey,input.apiKey);
     assert.equal(provider.defaultModel,'fixture-gui-model');assert.equal(providers.PROVIDER.id,initial.provider);assert.equal(SETTINGS.provider,initial.setting);
     const checked=await request();assert.equal(checked.status,200);assert.equal(checked.body.providerId,saved.body.providerId);assert.equal(checked.body.local.state,'ready');
+    if(process.env.OPENAI_BRIDGE_GUI_MULTI){
+      assert.equal(checked.body.capabilities.multiUpstream,true);
+      const first={name:'relay',endpoint:input.endpoint,apiKey:'',models:[{id:input.model}]};
+      const second={name:'relay-2',endpoint:input.endpoint,apiKey:'fixture-secondary-account-key',models:[{id:'relay-2/'+input.model,model:input.model}]};
+      const models=[{id:input.model,contextWindow:128000},{id:'relay-2/'+input.model,contextWindow:1048576}];
+      const full=await request({endpoint:input.endpoint,apiKey:'',model:models[1].id,models,upstreams:[first,second],consent:true});
+      assert.equal(full.status,200,JSON.stringify(full.body));assert.equal(full.body.providerId,saved.body.providerId);
+      assert.deepEqual(full.body.models,models);assert.equal(full.body.upstreams.length,2);
+      assert(!JSON.stringify(full.body).includes(second.apiKey));
+      const runtimeFile=path.join(target,'runtime-home/.claude-code-router/config.json'),runtime=JSON.parse(fs.readFileSync(runtimeFile));
+      assert.equal(runtime.Providers[0].api_key,input.apiKey);assert.equal(runtime.Providers[1].api_key,second.apiKey);
+      assert.equal(runtime.MODEL_ROUTES[models[1].id],'relay-2,'+input.model);
+      // 暂时锁住恢复，后面的持久化/移除验收不消耗真实重启预算。
+      const state=path.dirname(runtimeFile),fault=path.join(state,'recovery.failed'),attempts=path.join(state,'recovery.attempts');
+      fs.writeFileSync(fault,'recovery limit reached\n',{mode:0o600});fs.writeFileSync(attempts,'3\n',{mode:0o600});
+      const only={...second,apiKey:''};
+      const removed=await request({endpoint:input.endpoint,apiKey:'',model:models[1].id,models:[models[1]],upstreams:[only],consent:true});
+      assert.equal(removed.status,200,JSON.stringify(removed.body));assert.equal(removed.body.localError,'RECOVERY_EXHAUSTED');
+      assert.equal(removed.body.upstreams[0].name,'relay-2');assert.equal(removed.body.providerId,saved.body.providerId);
+      const retained=JSON.parse(fs.readFileSync(runtimeFile));assert.equal(retained.Providers.length,1);assert.equal(retained.Providers[0].api_key,second.apiKey);
+      const after=await request();assert.equal(after.status,200,JSON.stringify(after.body));assert.deepEqual(after.body.models,[models[1]]);
+      assert.equal(fs.readFileSync(attempts,'utf8'),'3\n');assert.equal(providers.PROVIDER.id,initial.provider);assert.equal(SETTINGS.provider,initial.setting);
+      console.log(JSON.stringify({ok:true,scope:'real App route + component multi-upstream + private real CCR',separateSameOriginKeys:true,primaryRemoval:true,stableAliases:true,windowPreserved:true,localIdentityPreserved:true,recoveryPreserved:true}));return;
+    }
     if(process.env.OPENAI_BRIDGE_GUI_CONFIGURING){
       // 从第一次启动后的真实恢复预算开始，不能为测试清零，也不把第四次配置重启误当成临时标记失败。
       const disabled=path.join(target,'disabled');fs.writeFileSync(disabled,'configuring\n',{mode:0o600});
