@@ -33,7 +33,7 @@ async function fixture(){
   const port=server.address().port;await new Promise(resolve=>server.close(resolve));
   const state=path.join(dir,'runtime-home/.claude-code-router');
   fs.mkdirSync(state,{recursive:true,mode:0o700});
-  for(const file of ['start-bridge.sh','bridge-common.sh','watchdog.sh','health.cjs'])fs.copyFileSync(path.join(root,'runtime',file),path.join(dir,file));
+  for(const file of ['start-bridge.sh','bridge-common.sh','watchdog.sh','health.cjs','service-registration.cjs'])fs.copyFileSync(path.join(root,'runtime',file),path.join(dir,file));
   const cli=path.join(dir,'node_modules/@musistudio/claude-code-router/dist/cli.js');
   fs.mkdirSync(path.dirname(cli),{recursive:true});
   fs.writeFileSync(cli,String.raw`const fs=require('node:fs'),path=require('node:path'),http=require('node:http');
@@ -160,6 +160,27 @@ async function test(name,body){
   await test('port collision leaves Hook fast and never kills the unrelated server',async f=>{
     const server=net.createServer();await new Promise(resolve=>server.listen(f.port,'127.0.0.1',resolve));
     try{const r=await f.hook();assert.equal(r.status,0,r.stderr);assert.ok(r.ms<1500,'hook waited for occupied port');assert.equal(server.listening,true);await sleep(250);}finally{await f.clean();await new Promise(resolve=>server.close(resolve));}
+  });
+  await test('Android alias metadata permits cold manual start and the retained Hook',async f=>{
+    const alias=file=>file.startsWith('/data/data/')?file.replace('/data/data/','/data/user/0/'):file.replace('/data/user/0/','/data/data/');
+    if(!/^\/data\/(?:data|user\/0)\//.test(f.dir)||!fs.existsSync(alias(f.dir)))return;
+    const marker=path.join(f.dir,'.ccr-bridge-kit.json');
+    fs.writeFileSync(marker,JSON.stringify({id:'ccr-bridge-kit',target:alias(f.dir),componentEntry:alias(f.entry)}));
+    const before=fs.readFileSync(marker);
+    const manual=await run('bash',[path.join(alias(f.dir),'start-bridge.sh')],f.env,10000);
+    assert.equal(manual.status,0,manual.stdout+manual.stderr);assert.equal(await f.healthy(),true);
+    const hook=await f.hook();assert.equal(hook.status,0,hook.stderr);
+    assert.equal(fs.readFileSync(path.join(f.state,'fake-starts'),'utf8').trim(),'start');
+    assert.deepEqual(fs.readFileSync(marker),before,'startup must not rewrite alias metadata');
+  });
+  await test('Android alias entry parents cannot hide a symlink below the component root',async f=>{
+    const alias=file=>file.replace(/^\/data\/data\//,'/data/user/0/');
+    if(!f.dir.startsWith('/data/data/')||!fs.existsSync(alias(f.dir)))return;
+    const linked=path.join(f.dir,'linked-component');fs.symlinkSync(path.dirname(f.entry),linked);
+    fs.writeFileSync(path.join(f.dir,'.ccr-bridge-kit.json'),JSON.stringify({id:'ccr-bridge-kit',target:alias(f.dir),componentEntry:alias(path.join(linked,'component.cjs'))}));
+    const r=await run('bash',[path.join(f.dir,'start-bridge.sh')],f.env);
+    assert.notEqual(r.status,0);assert.equal(fs.existsSync(path.join(f.dir,'patch-runs')),false);
+    assert.equal(await f.healthy(),false);
   });
   await test('missing component entry blocks Hook, manual start and direct watchdog',async f=>{
     fs.unlinkSync(f.entry);

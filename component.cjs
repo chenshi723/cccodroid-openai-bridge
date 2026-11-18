@@ -11,7 +11,7 @@ function run(file,argv){
   process.exitCode=result.status??1;
 }
 try{
-  // 仅 HOME 信任根允许 realpath（应用 HOME 可是 Android 路径别名）；显式 --dir 不规范化。
+  // 只归并可信根的别名；--dir 以下的链接仍由当前安装器逐项拒绝。
   const home=api.trustedHome();process.env.HOME=home;
   if(command==='--selftest'){
     if(args.length)throw new Error('selftest 不接受额外参数。');
@@ -32,19 +32,19 @@ try{
     if(command==='configure'){
       run(path.join(__dirname,'installer.cjs'),['install',...args,'--bundled-runtime',__dirname]);
     }else if(command==='ensure'||(command==='uninstall'&&scoped)){
-      const target=options.dir===undefined?path.join(home,'.local/share/ccr-bridge-kit'):path.resolve(options.dir);
+      const target=options.dir===undefined?path.join(home,'.local/share/ccr-bridge-kit'):api.normalizedPath(path.resolve(options.dir));
       // 固定入口必须保留实例核对，不能将新参数交给可能不认识它们的旧 manage.cjs。
       // 当前安装器验证既有 manifest/注册/运行文件后管理它；绝不覆盖私有运行副本。
-      const forwarded=options.dir===undefined?[...args,'--dir',target]:args;
+      const forwarded=options.dir===undefined?[...args,'--dir',target]:args.map((value,i)=>args[i-1]==='--dir'?target:value);
       run(path.join(__dirname,'installer.cjs'),[command,...forwarded]);
     }else{
-      const target=options.dir===undefined?path.join(home,'.local/share/ccr-bridge-kit'):path.resolve(options.dir);
+      const target=options.dir===undefined?path.join(home,'.local/share/ccr-bridge-kit'):api.normalizedPath(path.resolve(options.dir));
       const marker=path.join(target,'.ccr-bridge-kit.json');
       if(!fs.existsSync(marker))throw new Error('尚未配置此安装。请用户在终端运行 openai-bridge configure。');
       const manifest=JSON.parse(fs.readFileSync(marker,'utf8'));
-      if(manifest.id!=='ccr-bridge-kit'||path.resolve(manifest.target)!==target)throw new Error('不是受管理的桥安装。');
+      if(manifest.id!=='ccr-bridge-kit'||api.normalizedPath(manifest.target)!==target)throw new Error('不是受管理的桥安装。');
       // 手动清理不要求新实例协议；保留旧运行副本自带管理器，不擅自覆盖它。
-      const forwarded=options.dir===undefined?[...args,'--dir',target]:args;
+      const forwarded=options.dir===undefined?[...args,'--dir',target]:args.map((value,i)=>args[i-1]==='--dir'?target:value);
       run(path.join(target,'manage.cjs'),[command,...forwarded]);
     }
   }else throw new Error('未知操作；运行 openai-bridge --help 查看用法。');

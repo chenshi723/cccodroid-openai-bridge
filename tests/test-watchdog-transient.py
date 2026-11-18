@@ -35,7 +35,7 @@ class Fixture:
         self.state.mkdir(parents=True, mode=0o700)
         self.cli = self.root / 'node_modules/@musistudio/claude-code-router/dist/cli.js'
         self.cli.parent.mkdir(parents=True)
-        for name in ['bridge-common.sh', 'watchdog.sh', 'health.cjs', 'start-bridge.sh']:
+        for name in ['bridge-common.sh', 'watchdog.sh', 'health.cjs', 'start-bridge.sh', 'service-registration.cjs']:
             shutil.copyfile(source / name, self.root / name)
         (self.root / 'patch-ccr.js').write_text('process.exit(0);\n')
         (self.root / 'component.cjs').write_text('// disposable component identity\n')

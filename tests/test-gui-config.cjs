@@ -562,7 +562,10 @@ test('canonical HOME and HOME alias manage the same default GUI/CLI instance wit
   for(const HOME of [f.home,alias]){
     const ready=f.run('ensure',undefined,{args:['--endpoint',endpoint,'--instance',m.service.instanceId],env:{HOME}});assert.equal(ready.status,0,ready.stdout+ready.stderr);assert.equal(JSON.parse(ready.stdout).ready,true);
   }
-  const explicit=f.run('ensure',undefined,{args:['--dir',path.join(alias,'.local/share/ccr-bridge-kit'),'--endpoint',endpoint,'--instance',m.service.instanceId],env:{HOME:alias}});assert.equal(explicit.status,1);
+  const explicit=f.run('ensure',undefined,{args:['--dir',path.join(alias,'.local/share/ccr-bridge-kit'),'--endpoint',endpoint,'--instance',m.service.instanceId],env:{HOME:alias}});assert.equal(explicit.status,0,explicit.stdout+explicit.stderr);assert.equal(JSON.parse(explicit.stdout).ready,true);
+  const nested=path.join(f.home,'linked-runtime');fs.symlinkSync(f.target,nested);
+  const unsafe=f.run('ensure',undefined,{args:['--dir',path.join(alias,'linked-runtime'),'--endpoint',endpoint,'--instance',m.service.instanceId],env:{HOME:alias}});assert.equal(unsafe.status,1,'links below the trusted HOME alias remain forbidden');
+  fs.unlinkSync(nested);
   saved(f,{...input,apiKey:''});assert.equal(result(f.run('gui-configure',{...input,apiKey:''},{env:{HOME:alias}})).configured,true);
   const stop=f.run('uninstall',undefined,{args:['--endpoint',JSON.parse(fs.readFileSync(f.registry)).endpoint,'--instance',m.service.instanceId,'--yes'],env:{HOME:alias}});assert.equal(stop.status,0,stop.stdout+stop.stderr);assert.equal(fs.existsSync(f.registry),false);
 }));

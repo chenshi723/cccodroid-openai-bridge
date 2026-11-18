@@ -11,6 +11,8 @@ const assert=require('node:assert/strict');
 const sourceKit=process.env.OPENAI_BRIDGE_TEST_SOURCE?path.resolve(process.env.OPENAI_BRIDGE_TEST_SOURCE):path.resolve(__dirname,'..');
 let kit=sourceKit;
 const bundled=process.argv.includes('--bundled');
+const aliases=process.argv.includes('--aliases');
+const alternate=file=>file.startsWith('/data/data/')?file.replace('/data/data/','/data/user/0/'):file.startsWith('/data/user/0/')?file.replace('/data/user/0/','/data/data/'):file;
 let testEnv;
 function exec(args,opts={}){
   if(bundled){
@@ -121,7 +123,16 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     }
     console.log('PASS foreign/empty endpoint cold Hooks do not start any bridge or watchdog');
     if(bundled){
-      const ensure=['ensure','--dir',target,'--endpoint',service.endpoint,'--instance',service.instanceId];
+      if(aliases){
+        assert.notEqual(alternate(target),target,'--aliases needs Android app prefixes');
+        assert.equal(fs.statSync(alternate(target)).ino,fs.statSync(target).ino);
+        const marker=path.join(target,'.ccr-bridge-kit.json'),m=JSON.parse(fs.readFileSync(marker));
+        m.target=alternate(target);m.settings=alternate(settings);m.service.home=alternate(home);m.componentEntry=alternate(m.componentEntry);
+        fs.writeFileSync(marker,JSON.stringify(m,null,2)+'\n',{mode:0o600});
+        service.runtimeDir=alternate(target);fs.writeFileSync(serviceFile,JSON.stringify(service,null,2)+'\n',{mode:0o600});
+        console.log('PASS disposable legacy alias manifest/registration retained without manual normalization');
+      }
+      const ensure=['ensure','--dir',aliases?alternate(target):target,'--endpoint',service.endpoint,'--instance',service.instanceId];
       const bad=await exec([...ensure.slice(0,-1),'0'.repeat(32)]);
       assert.notEqual(bad.status,0);assert.equal(fs.existsSync(path.join(state,'watchdog.pid')),false);
       const results=await Promise.all(Array.from({length:4},()=>exec(ensure)));
@@ -228,7 +239,7 @@ const listen=server=>new Promise((resolve,reject)=>{server.once('error',reject);
     // Simulate App removing the component entry while leaving the private runtime and Hook.
     const manifest=JSON.parse(fs.readFileSync(path.join(target,'.ccr-bridge-kit.json')));
     const componentEntry=path.join(kit,'component.cjs'), removedEntry=componentEntry+'.removed-for-test';
-    assert.equal(manifest.componentEntry,componentEntry);
+    assert.equal(manifest.componentEntry,aliases?alternate(componentEntry):componentEntry);
     fs.renameSync(componentEntry,removedEntry);
     try{
       r=await command('bash',[path.join(target,'start-bridge.sh'),'--hook'],{env:{...testEnv,ANTHROPIC_BASE_URL:connection.baseUrl}});

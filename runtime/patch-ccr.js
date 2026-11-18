@@ -433,6 +433,50 @@ const MODEL_ROUTE_NEW = `  const Router = projectSpecificRouter || config.Router
   }
   if (req.body.model.includes(",")) {`;
 
+// 15) OpenAI 兼容端点（/v1/chat/completions）在 preHandler 里无条件按 "," 拆 model：
+//     裸模型名 gpt-6.1-sol 会被当成 provider 名 → 404 Provider not found。
+//     cccodroid 的小蓝、别的 OpenAI 客户端发的都是裸名，所以每次都是 404。
+//     补丁：没有逗号时按 getUseModel() 的同一套规则找上游（MODEL_ROUTES 优先，再找唯一声明该模型的上游）。
+//     多上游同名模型且没写路由时不猜（保持原行为，宁可 404 也不路由错）。
+const BARE_OLD = `          let [u, ...f] = i.model.split(",");
+          i.model = f.join(","), n.provider = u;`;
+const BARE_MARK = "// ccr-bare-model-route-v2:";
+const BARE_NEW = `          let [u, ...f] = i.model.split(",");
+          // ccr-bare-model-route-v2: 裸模型名走和 /v1/messages 同一套规则
+          if (!f.length) {
+            const bareWanted = String(u);
+            const bareFold = bareWanted.toLowerCase();
+            const bareSvc = n.server && n.server._server && n.server._server.configService;
+            const bareAll = (bareSvc && (bareSvc.get("Providers") || bareSvc.get("providers"))) || [];
+            const bareList = Array.isArray(bareAll) ? bareAll : [];
+            const bareRoutes = (bareSvc && bareSvc.get("MODEL_ROUTES")) || {};
+            const barePick = (providerName, modelName) => {
+              const byName = bareList.filter((p) => p && typeof p.name === "string" && String(p.name).toLowerCase() === String(providerName).toLowerCase());
+              const provider = byName.length === 1 ? byName[0] : void 0;
+              if (!provider || !Array.isArray(provider.models)) return void 0;
+              const hit = provider.models.filter((m) => typeof m === "string" && m.toLowerCase() === String(modelName).toLowerCase());
+              return hit.length === 1 ? provider.name + "," + hit[0] : void 0;
+            };
+            let bareRoute;
+            const mapped = Object.prototype.hasOwnProperty.call(bareRoutes, bareWanted) ? bareRoutes[bareWanted] : void 0;
+            if (typeof mapped === "string" && mapped.includes(",")) {
+              const comma = mapped.indexOf(",");
+              bareRoute = barePick(mapped.slice(0, comma).trim(), mapped.slice(comma + 1).trim());
+            }
+            if (!bareRoute) {
+              const declaring = bareList.filter((p) => p && Array.isArray(p.models) && p.models.some((m) => typeof m === "string" && m.toLowerCase() === bareFold));
+              if (declaring.length === 1) {
+                const exact = declaring[0].models.find((m) => typeof m === "string" && m.toLowerCase() === bareFold);
+                bareRoute = declaring[0].name + "," + exact;
+              }
+            }
+            if (bareRoute) {
+              const comma = bareRoute.indexOf(",");
+              [u, ...f] = [bareRoute.slice(0, comma), bareRoute.slice(comma + 1)];
+            }
+          }
+          i.model = f.join(","), n.provider = u;`;
+
 // 14) Gemini 3 的 OpenAI 兼容接口要求把工具调用的 thought signature 原样带回，缺了就 400
 //     （cccodroid #91）。签名在 tool_calls[].extra_content.google.thought_signature；
 //     Claude Code 的历史里没有这个字段，桥按 tool_call id 记在进程内（有界，桥重启即清）。
@@ -554,6 +598,9 @@ patch("fresh connection", 'keepAliveMaxTimeout: 1', AGENT_OLD, AGENT_NEW);
 if (!src.includes("// ccr-reasoning-fallback-v1") && src.split(REASON_OLD).length > 2) missing.push("reasoning fallback (anchor not unique)");
 else patch("reasoning fallback", "// ccr-reasoning-fallback-v1", REASON_OLD, REASON_NEW);
 patch("explicit stream", 'stream: e.stream === true, tools:', STREAM_OLD, STREAM_NEW);
+// 锚点必须唯一：dist 里若别处也有同样的拆分行，宁可报缺也不错打
+if (!src.includes(BARE_MARK) && src.split(BARE_OLD).length > 2) missing.push("bare model route (anchor not unique)");
+else patch("bare model route", BARE_MARK, BARE_OLD, BARE_NEW);
 patch("JSON/SSE response", SSE_MARK, src.includes(SSE_FALLBACK) ? SSE_FALLBACK : SSE_OLD, SSE_NEW);
 patch("tool result images", "// ccr-tool-images-v1:", TOOL_IMAGES_OLD, TOOL_IMAGES_NEW);
 patch("image token estimate", "// ccr-image-token-estimate-v1", IMAGE_TOKENS_OLD, IMAGE_TOKENS_NEW);
@@ -697,7 +744,7 @@ if (changed) {
     if (fs.existsSync(temp)) fs.unlinkSync(temp);
   }
   if (process.exitCode) process.exit(process.exitCode);
-  console.log("[patch-ccr] patched: " + ["effort", "uncaughtException", "unhandledRejection", "stream reader", "upstream cancel", "error handler", "request body log", "fresh connection", "reasoning fallback", "explicit stream", "JSON/SSE response", "tool result images", "image token estimate", "configured model route", "thought signature", "bundled static security"].join(", "));
+  console.log("[patch-ccr] patched: " + ["effort", "uncaughtException", "unhandledRejection", "stream reader", "upstream cancel", "error handler", "request body log", "fresh connection", "reasoning fallback", "explicit stream", "JSON/SSE response", "tool result images", "image token estimate", "configured model route", "thought signature", "bundled static security", "bare model route"].join(", "));
   process.exit(2);   // 刚打上：正在跑的实例还是旧代码，调用方应重启
 }
 console.log("[patch-ccr] already patched");

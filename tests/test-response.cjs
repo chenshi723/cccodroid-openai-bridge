@@ -11,7 +11,7 @@ const { EventEmitter } = require("node:events");
 const source = path.resolve(__dirname, "..");
 const patchFile = path.join(source, "runtime/patch-ccr.js");
 const cliFile = path.join(source, "node_modules/@musistudio/claude-code-router/dist/cli.js");
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccr-response-test-"));
+const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ccr-response-test-")));
 let passed = 0;
 
 async function test(name, run) {

@@ -35,12 +35,17 @@ bridge_component_state() {
       const root=process.argv[1],file=path.join(root,".ccr-bridge-kit.json"),st=fs.lstatSync(file);
       if(!st.isFile()||st.nlink!==1||st.size>65536||fs.realpathSync(root)!==root)process.exit(1);
       const text=fs.readFileSync(file),m=JSON.parse(text);
-      if(m.id!=="ccr-bridge-kit"||m.target!==root||typeof m.componentEntry!=="string"||!path.isAbsolute(m.componentEntry)||path.resolve(m.componentEntry)!==m.componentEntry)process.exit(1);
+      const helper=path.join(root,"service-registration.cjs"),helperStat=fs.lstatSync(helper);
+      if(!helperStat.isFile()||helperStat.nlink!==1||fs.realpathSync(helper)!==helper)process.exit(1);
+      const {normalizedPath}=require(helper);
+      const roots=[root,process.env.PREFIX].filter(Boolean),normalize=p=>normalizedPath(p,roots);
+      if(m.id!=="ccr-bridge-kit"||normalize(m.target)!==normalize(root))process.exit(1);
+      const component=normalize(m.componentEntry);
       const stamp=crypto.createHash("sha256").update(text).update(String(st.dev)+":"+st.ino).digest("hex");
       if(process.argv[2]&&process.argv[2]!==stamp)process.exit(1);
       console.log(stamp);
-      let entry;try{entry=fs.lstatSync(m.componentEntry);}catch(error){if(error.code==="ENOENT")process.exit(3);throw error;}
-      if(!entry.isFile()||entry.nlink!==1||fs.realpathSync(m.componentEntry)!==m.componentEntry)process.exit(1);
+      let entry;try{entry=fs.lstatSync(component);}catch(error){if(error.code==="ENOENT")process.exit(3);throw error;}
+      if(!entry.isFile()||entry.nlink!==1||fs.realpathSync(component)!==component)process.exit(1);
     } catch { process.exit(1); }
   ' "$BR" "${1:-}" 2>/dev/null
 }
@@ -76,6 +81,15 @@ strip_linker() {
   return 0
 }
 
+# 先作便宜的精确比较；不同写法只接受已验证的根别名，不跟脚本/状态子路径的链接。
+bridge_path_same() {
+  [[ "$1" = "$2" ]] && return 0
+  node -e '
+    const path=require("node:path"),{samePath}=require(path.join(process.argv[1],"service-registration.cjs"));
+    process.exit(samePath(process.argv[2],process.argv[3],[process.argv[1],process.env.PREFIX].filter(Boolean))?0:1);
+  ' "$BR" "$1" "$2" 2>/dev/null
+}
+
 # 不凭 PID 文件就杀进程：同时校验 Node、完整脚本路径（或原看护的相对路径 + cwd）。
 bridge_process() {
   local pid=$1
@@ -85,9 +99,9 @@ bridge_process() {
   { mapfile -d '' -t args < "/proc/$pid/cmdline"; } 2>/dev/null || return 1
   strip_linker
   [[ ${#args[@]} -ge 3 && ${args[0]##*/} = node && ${args[2]} = start ]] || return 1
-  [[ ${args[1]} = "$CLI" ]] && return 0
+  bridge_path_same "${args[1]}" "$CLI" && return 0
   [[ ${args[1]} = node_modules/@musistudio/claude-code-router/dist/cli.js ]] &&
-    [[ $(readlink "/proc/$pid/cwd" 2>/dev/null) = "$BR" ]]
+    bridge_path_same "$(readlink "/proc/$pid/cwd" 2>/dev/null)" "$BR"
 }
 
 bridge_pid() {
@@ -156,7 +170,7 @@ watchdog_running() {
   kill -0 "$pid" 2>/dev/null || return 1
   { mapfile -d '' -t args < "/proc/$pid/cmdline"; } 2>/dev/null || return 1
   strip_linker
-  [[ ${#args[@]} -ge 2 && ${args[0]##*/} = bash && ${args[1]} = "$BR/watchdog.sh" ]] || return 1
+  [[ ${#args[@]} -ge 2 && ${args[0]##*/} = bash ]] && bridge_path_same "${args[1]}" "$BR/watchdog.sh" || return 1
   # PID 仍在但锁已释放，也不能算一个有效的看护。
   ! flock -n "$STATE/watchdog.lock" true
 }
