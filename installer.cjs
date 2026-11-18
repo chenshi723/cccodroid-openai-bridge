@@ -1088,7 +1088,7 @@ async function gui(command,args){
 function purgeTarget(target) {
   target=normalizedPath(target);
   if(fs.lstatSync(target).isSymbolicLink() || fs.realpathSync(target)!==target)throw new Error('清理目标或父路径有符号链接，拒绝删除。');
-  if(!underDir(target,trustedHome())&&!underDir(target,normalizedPath(path.resolve(os.tmpdir()))))throw new Error('清理目标必须位于私有 HOME 或临时目录的专用子目录。');
+  if(!underDir(target,trustedHome())&&!underDir(target,normalizedPath(fs.realpathSync(os.tmpdir()))))throw new Error('清理目标必须位于私有 HOME 或临时目录的专用子目录。');
   const manifest=loadManifest(target);
   safeTarget(target,path.resolve(manifest.settings));
   return target;

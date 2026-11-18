@@ -46,6 +46,18 @@ function instance(root){
   return {home,target,settings,m,id,port,env,run};
 }
 
+test('purge accepts a canonical fixture beneath a trusted TMPDIR root alias only',()=>fixture(root=>{
+  const f=instance(root),temp=path.join(root,'real-tmp'),alias=path.join(root,'tmp-alias'),target=path.join(temp,'owned-runtime');
+  fs.mkdirSync(target,{recursive:true});fs.symlinkSync(temp,alias);
+  const marker=path.join(target,'.ccr-bridge-kit.json');save(marker,{id:'ccr-bridge-kit',version:'1.0.5',target,settings:f.settings});
+  const run=file=>spawnSync(process.execPath,['-e','require(process.argv[1]).purgeTarget(process.argv[2])',path.join(source,'installer.cjs'),file],{env:{...f.env,TMPDIR:alias},encoding:'utf8',timeout:5000});
+  const accepted=run(target);assert.equal(accepted.status,0,accepted.stdout+accepted.stderr);
+  const linked=path.join(temp,'linked-target');fs.symlinkSync(target,linked);assert.notEqual(run(linked).status,0,'target symlink must still fail');
+  const outside=path.join(root,'outside');fs.mkdirSync(outside);save(path.join(outside,'.ccr-bridge-kit.json'),{id:'ccr-bridge-kit',version:'1.0.5',target:outside,settings:f.settings});
+  assert.notEqual(run(outside).status,0,'sibling outside HOME/TMPDIR must still fail');
+  assert.equal(fs.existsSync(marker),true,'range checking must not delete the fixture');
+}));
+
 test('trusted root alias is projected without following descendant links',()=>fixture(root=>{
   const home=path.join(root,'home'),alias=path.join(root,'trusted-home');fs.mkdirSync(home);fs.symlinkSync(home,alias);
   assert.equal(registration.normalizedPath(path.join(alias,'bridge'),[alias]),path.join(home,'bridge'));
