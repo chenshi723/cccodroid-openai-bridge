@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const { spawn, spawnSync } = require("node:child_process");
+const registration = require("./service-registration.cjs");
 
 const root = path.resolve(__dirname, "..");
 const listen = (server) => new Promise((resolve, reject) => {
@@ -15,9 +16,31 @@ const listen = (server) => new Promise((resolve, reject) => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main() {
-  const temp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "openai-bridge-selftest-"));
+  const temp = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "openai-bridge-selftest-")));
   let child, upstream, output = "", passed = 0;
   try {
+    // 安装后的自检也走真实 shell 判定和固定卸载入口，不只测协议转换。
+    const fixture=path.join(temp,"alias-fixture"),fixtureState=path.join(fixture,"runtime-home/.claude-code-router");
+    fs.mkdirSync(fixtureState,{recursive:true});
+    const files={},hash=data=>require("node:crypto").createHash("sha256").update(data).digest("hex");
+    for(const name of ["bridge-common.sh","start-bridge.sh","watchdog.sh","patch-ccr.js","health.cjs","service-registration.cjs"]){
+      const data=fs.readFileSync(path.join(__dirname,name));fs.writeFileSync(path.join(fixture,name),data);files[name]=hash(data);
+    }
+    fs.writeFileSync(path.join(fixture,"port"),"34591\n");files.port=hash("34591\n");
+    const alias=file=>file.startsWith("/data/data/")?file.replace("/data/data/","/data/user/0/"):file.startsWith("/data/user/0/")?file.replace("/data/user/0/","/data/data/"):file;
+    const alternate=fs.existsSync(alias(temp))?alias:x=>x;
+    const settings=path.join(temp,"settings.json"),instanceId="1".repeat(32);
+    fs.writeFileSync(settings,"{}");
+    const marker=path.join(fixture,".ccr-bridge-kit.json");
+    fs.writeFileSync(marker,JSON.stringify({id:"ccr-bridge-kit",version:"1.0.5",target:alternate(fixture),settings:alternate(settings),componentEntry:alternate(path.join(root,"component.cjs")),service:{schema:1,home:alternate(temp),instanceId},files}));
+    const check=spawnSync("bash",["-c",'source "$1/bridge-common.sh" && bridge_component_state',"selftest",alternate(fixture)],{encoding:"utf8",timeout:5000});
+    assert.equal(check.status,0,"alias shell component check: "+check.stderr);
+    registration.register(temp,alternate(fixture),34591,instanceId);
+    const retired=spawnSync(process.execPath,[path.join(root,"component.cjs"),"uninstall","--dir",fixture,"--endpoint","http://127.0.0.1:34591","--instance",instanceId,"--yes"],{env:{...process.env,HOME:temp},encoding:"utf8",timeout:20000});
+    assert.equal(retired.status,0,"alias fixed uninstall: "+retired.stderr);
+    assert.equal(fs.existsSync(registration.fileOf(temp)),false);
+    assert.equal(fs.readFileSync(path.join(fixture,"disabled"),"utf8"),"uninstalled\n");
+    console.log("PASS trusted path aliases; shell/start metadata + fixed uninstall; private data preserved");
     const dist = path.join(temp, "node_modules/@musistudio/claude-code-router/dist");
     fs.mkdirSync(dist, { recursive: true });
     for (const name of ["@fastify", "@isaacs", "fastify", "ajv", "fast-uri", "find-my-way", "undici", "minimatch", "glob", "shell-quote"]) {
@@ -117,6 +140,17 @@ async function main() {
       console.log(`PASS ${model} stream=${stream}; text + effort preserved`);
     }
     assert.equal(seen.length, 3);
+    for(const [model,status] of [["json",200],["unknown-selftest-model",404]]){
+      const before=seen.length;
+      const response=await fetch(`http://127.0.0.1:${port}/v1/chat/completions`,{
+        method:"POST",signal:AbortSignal.timeout(5000),headers:{"content-type":"application/json","x-api-key":"local-test-only"},
+        body:JSON.stringify({model,max_tokens:16,stream:false,messages:[{role:"user",content:"local route selftest"}]})
+      });
+      const text=await response.text();assert.equal(response.status,status,text);
+      assert.equal(seen.length-before,status===200?1:0);
+      if(status===200){assert.match(text,/LOCAL_OK/);assert.equal(seen.at(-1).model,model);}
+    }
+    console.log("PASS openai bare model routed / unknown stays 404");
     // 上游不认推理参数：第一次 400 后去掉重发并记住，第二次直接不带（#84）
     for (const round of [1, 2]) {
       const before = seen.length;

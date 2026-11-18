@@ -18,6 +18,11 @@ jobs:
       - run: npm test
         env:
           TMPDIR: ${{ runner.temp }}
+      - name: Bundle lifecycle with noncanonical TMPDIR
+        run: |
+          mkdir -p "$RUNNER_TEMP/bridge-real-tmp"
+          ln -s "$RUNNER_TEMP/bridge-real-tmp" "$RUNNER_TEMP/bridge-tmp-alias"
+          TMPDIR="$RUNNER_TEMP/bridge-tmp-alias" node tests/test-install-e2e.cjs --bundled
       - run: python3 tests/test-watchdog-transient.py
         env:
           TMPDIR: ${{ runner.temp }}

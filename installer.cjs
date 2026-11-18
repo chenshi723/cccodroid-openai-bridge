@@ -20,9 +20,11 @@ const registration = require(exists(path.join(SOURCE,'service-registration.cjs')
 const COMMANDS = new Set(['install','status','start','ensure','stop','uninstall','connection']);
 const sha = data => crypto.createHash('sha256').update(data).digest('hex');
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
-// HOME 是唯一可规范化的信任根（Android 的应用 HOME 可经 /data/data 别名进入）。
-// 只在构造默认路径前 realpath；显式 target 及 HOME 以下的链接仍须逐项拒绝。
-function trustedHome() { const home=fs.realpathSync(os.homedir());instanceDirectory(home);return home; }
+// 可信 HOME 与组件根只归并系统前缀/调用者的根别名；子目录链接仍逐项拒绝。
+const pathRoots=[os.homedir(),SOURCE];
+const normalizedPath=file=>registration.normalizedPath(file,pathRoots);
+const samePath=(a,b)=>{try{return normalizedPath(a)===normalizedPath(b);}catch{return false;}};
+function trustedHome() { const home=normalizedPath(fs.realpathSync(os.homedir()));instanceDirectory(home);return home; }
 
 function atomic(file, content, mode=0o600) {
   fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
@@ -58,10 +60,11 @@ function checkTools(bundled) {
   if(!fs.existsSync('/proc/self/cmdline'))throw new Error('当前安装包只支持具有 /proc 的 Android/Linux，不支持 Windows/macOS。');
 }
 function safeTarget(input,settings) {
-  const target=path.resolve(input);
+  const target=normalizedPath(path.resolve(input));
+  settings=normalizedPath(path.resolve(settings));
   const home=trustedHome();
-  if(target==='/'||target===home||path.basename(target)==='.claude')throw new Error('安装目录必须是专用子目录，不能是根目录、HOME 或 .claude。');
-  if(settings===target || settings.startsWith(target+path.sep))throw new Error('Claude 设置不能放进安装目录，避免卸载误删。');
+  if(target==='/'||target===home||sameDir(target,home)||path.basename(target)==='.claude')throw new Error('安装目录必须是专用子目录，不能是根目录、HOME 或 .claude。');
+  if(settings===target || settings.startsWith(target+path.sep)||insideOrSame(settings,target))throw new Error('Claude 设置不能放进安装目录，避免卸载误删。');
   let p=target;
   while(!exists(p))p=path.dirname(p);
   const resolved=path.join(fs.realpathSync(p),path.relative(p,target));
@@ -88,15 +91,17 @@ function mergeHook(settings,target) {
   const result=structuredClone(settings);
   result.hooks??={};
   result.hooks.SessionStart??=[];
-  const entry=hookEntry(target), expected=entry.hooks[0], legacy=legacyHookEntry(target).hooks[0];
+  const entry=hookEntry(target),aliases=registration.pathAliases(target);
+  const expected=aliases.map(alias=>hookEntry(alias).hooks[0]),legacy=aliases.map(alias=>legacyHookEntry(alias).hooks[0]);
   let current=false, old=false;
   for(const group of result.hooks.SessionStart){
     for(const hook of Array.isArray(group?.hooks)?group.hooks:[]){
-      if(hook?.command===expected.command){
-        if(!same(hook,expected)||group?.matcher!==entry.matcher)throw new Error('已有同路径 hook 被定制，拒绝覆盖。');
+      const matched=expected.find(h=>h.command===hook?.command),prior=legacy.find(h=>h.command===hook?.command);
+      if(matched){
+        if(!same(hook,matched)||group?.matcher!==entry.matcher)throw new Error('已有同路径 hook 被定制，拒绝覆盖。');
         current=true;
-      }else if(hook?.command===legacy.command){
-        if(!same(hook,legacy))throw new Error('已有同路径 hook 被定制，拒绝覆盖。');
+      }else if(prior){
+        if(!same(hook,prior))throw new Error('已有同路径 hook 被定制，拒绝覆盖。');
         old=true;
       }
     }
@@ -104,7 +109,7 @@ function mergeHook(settings,target) {
   if(old || current){
     result.hooks.SessionStart=result.hooks.SessionStart.flatMap(g=>{
       if(!Array.isArray(g?.hooks))return [g];
-      const hooks=g.hooks.filter(h=>h?.command!==legacy.command&&h?.command!==expected.command);
+      const hooks=g.hooks.filter(h=>![...legacy,...expected].some(entry=>h?.command===entry.command));
       if(hooks.length===g.hooks.length)return [g];
       return hooks.length?[{...g,hooks}]:[];
     });
@@ -115,10 +120,10 @@ function mergeHook(settings,target) {
 function removeHook(settings,target) {
   const result=structuredClone(settings);
   if(!result.hooks?.SessionStart)return result;
-  const expected=hookEntry(target).hooks[0], legacy=legacyHookEntry(target).hooks[0];
+  const expected=registration.pathAliases(target).flatMap(alias=>[hookEntry(alias).hooks[0],legacyHookEntry(alias).hooks[0]]);
   result.hooks.SessionStart=result.hooks.SessionStart.flatMap(g=>{
     if(!Array.isArray(g?.hooks))return [g];
-    const hooks=g.hooks.filter(h=>!same(h,expected)&&!same(h,legacy));
+    const hooks=g.hooks.filter(h=>!expected.some(entry=>same(h,entry)));
     if(hooks.length===g.hooks.length)return [g];
     return hooks.length?[{...g,hooks}]:[];
   });
@@ -414,7 +419,7 @@ function loadManifest(target) {
   const p=path.join(target,MARKER);
   if(!exists(p))throw new Error('该目录不是由本安装器管理的安装：'+target);
   const m=JSON.parse(instanceFile(p,65536).data);
-  if(!object(m)||m.id!=='ccr-bridge-kit'||m.version!==VERSION||typeof m.target!=='string'||path.resolve(m.target)!==target)throw new Error('安装标记不匹配，拒绝操作。');
+  if(!object(m)||m.id!=='ccr-bridge-kit'||m.version!==VERSION||!samePath(m.target,target))throw new Error('安装标记不匹配，拒绝操作。');
   return m;
 }
 function managedIntact(target,m) {
@@ -437,12 +442,20 @@ function regularFile(file) {
   return st;
 }
 function sameFile(a,b) { return a.dev===b.dev&&a.ino===b.ino; }
+// 保留 r20 的目录身份包含关系；不存在的路径仍逐级检查其已存在父目录。
+function sameDir(a,b) { try{return sameFile(fs.lstatSync(a),fs.lstatSync(b));}catch{return false;} }
+function insideOrSame(p,root) {
+  for(let q=p;;q=path.dirname(q)){if(sameDir(q,root))return true;if(path.dirname(q)===q)return false;}
+}
+function underDir(p,root) { return !sameDir(p,root)&&insideOrSame(p,root); }
 function instanceDirectory(dir) {
+  dir=normalizedPath(dir);
   const st=fs.lstatSync(dir);
   if(!st.isDirectory()||fs.realpathSync(dir)!==dir)throw new Error('实例目录或父路径不规范，拒绝操作。');
   return st;
 }
 function openInstanceDirectory(dir) {
+  dir=normalizedPath(dir);
   const st=instanceDirectory(dir),fd=fs.openSync(dir,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
   const check=()=>{
     if(!sameFile(st,fs.fstatSync(fd))||!sameFile(st,instanceDirectory(dir)))throw new Error('操作期间实例目录已变更。');
@@ -497,7 +510,7 @@ function checkInstance(target,options,previous=null,registered=true,stale=null) 
   // 与当前组件不一致的文件名记进 stale，不再当冲突。
   const targetStat=instanceDirectory(target),m=JSON.parse(instanceFile(path.join(target,MARKER),65536).data),home=trustedHome();
   const service=m?.service;
-  if(m?.id!=='ccr-bridge-kit'||m.version!==VERSION||m.target!==target||!object(service)||service.schema!==1||service.home!==home||fs.realpathSync(home)!==home||service.instanceId!==options.instance)throw new Error('本地桥实例注册不匹配。');
+  if(m?.id!=='ccr-bridge-kit'||m.version!==VERSION||!samePath(m.target,target)||!object(service)||service.schema!==1||!samePath(service.home,home)||fs.realpathSync(home)!==home||service.instanceId!==options.instance)throw new Error('本地桥实例注册不匹配。');
   const port=instancePort(target);
   if(options.endpoint!=='http://127.0.0.1:'+port)throw new Error('本地桥 endpoint 与实例端口不匹配。');
   if(typeof m.settings!=='string'||!path.isAbsolute(m.settings)||path.resolve(m.settings)!==m.settings)throw new Error('实例设置路径不规范。');
@@ -506,7 +519,8 @@ function checkInstance(target,options,previous=null,registered=true,stale=null) 
   instanceDirectory(registryDir);
   const current=exists(registryFile)?JSON.parse(instanceFile(registryFile,4096).data):null;
   const expected=registration.value(target,port,service.instanceId);
-  if(registered?(!object(current)||Object.keys(current).length!==5||!Object.keys(expected).every(k=>current[k]===expected[k])):current!==null)throw new Error('本地桥服务注册已变更，拒绝操作。');
+  const regSame=(a,b)=>object(a)&&Object.keys(a).length===5&&['schema','id','endpoint','instanceId'].every(k=>a[k]===b[k])&&samePath(a.runtimeDir,b.runtimeDir);
+  if(registered?!regSame(current,expected):current!==null)throw new Error('本地桥服务注册已变更，拒绝操作。');
   const allowed=new Set([...RUNTIME_FILES,'manage.cjs','stop.sh','uninstall.sh','status.sh','package.json','package-lock.json','port']);
   if(!object(m.files)||[...RUNTIME_FILES,'port'].some(name=>!Object.hasOwn(m.files,name)))throw new Error('实例缺少受管理的运行文件。');
   const sources={};
@@ -591,13 +605,13 @@ async function install(options) {
   const bundled=options['bundled-runtime']?path.resolve(options['bundled-runtime']):null;
   checkTools(bundled);
   const home=trustedHome();
-  const settings=path.resolve(options.settings||path.join(home,'.claude','settings.json'));
+  const settings=normalizedPath(path.resolve(options.settings||path.join(home,'.claude','settings.json')));
   const target=safeTarget(options.dir||path.join(home,'.local','share','ccr-bridge-kit'),settings);
   if(exists(target)){
     if(options.guiConfig)throw guiError('RUNTIME_CONFLICT');
     const m=loadManifest(target);
     managedIntact(target,m);
-    if(m.settings!==settings)throw new Error('重复安装不能更换 settings 路径。');
+    if(!samePath(m.settings,settings))throw new Error('重复安装不能更换 settings 路径。');
     if(options.config||options.port)throw new Error('重复安装不会覆盖现有密钥/端口；如需重配，请先卸载并备份自己的配置。');
     const original=readSettings(settings),merged=mergeHook(original,target);
     if(m.service){registration.register(m.service.home,target,Number(fs.readFileSync(path.join(target,'port'),'utf8').trim()),m.service.instanceId);}
@@ -784,7 +798,7 @@ function checkGuiRuntime(paths,previous=null,allowConfiguring=false,readOnly=fal
   instanceOptions('ensure',options);
   const stale=readOnly?[]:null,instance=checkInstance(target,options,previous?.instance,true,stale);
   const disabled=path.join(target,'disabled');
-  if(!paths.cli&&m.guiManaged!==true||m.settings!==settings||m.componentEntry!==path.join(SOURCE,'component.cjs'))throw guiError('RUNTIME_CONFLICT');
+  if(!paths.cli&&m.guiManaged!==true||!samePath(m.settings,settings)||!samePath(m.componentEntry,path.join(SOURCE,'component.cjs')))throw guiError('RUNTIME_CONFLICT');
   // disabled 是生命周期状态，不是实例冲突；stopMetadata 已有界拒绝链接/非普通文件。
   // allowConfiguring 只豁免本次事务自己的临时标记，不能豁免其他 disabled。
   const disabledText=exists(disabled)?instanceFile(disabled,32).data.toString('utf8'):null;
@@ -1025,8 +1039,8 @@ function guiRetired(paths){
   // 不用 loadManifest：它要求版本号与当前组件一致，组件升了版本（比如 1.0.6）后旧版卸载留下的目录就认不出了，又回到配不上。
   // 只在这里放宽到同系列的任意版本号，其余身份字段照旧严格；认出来也只是改名让位，不读不执行
   let m;try{m=JSON.parse(instanceFile(path.join(target,MARKER),65536).data);}catch{return false;}
-  if(!object(m)||m.id!=='ccr-bridge-kit'||typeof m.version!=='string'||!/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(m.version)||m.target!==target)return false;
-  if(m.guiManaged!==true||m.settings!==settings||m.componentEntry!==path.join(SOURCE,'component.cjs'))return false;
+  if(!object(m)||m.id!=='ccr-bridge-kit'||typeof m.version!=='string'||!/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(m.version)||!samePath(m.target,target))return false;
+  if(m.guiManaged!==true||!samePath(m.settings,settings)||!samePath(m.componentEntry,path.join(SOURCE,'component.cjs')))return false;
   if(instanceFile(path.join(target,'disabled'),32).data.toString('utf8')!==RETIRED)return false;
   return registration.read(home)===null;
 }
@@ -1072,8 +1086,9 @@ async function gui(command,args){
   }
 }
 function purgeTarget(target) {
+  target=normalizedPath(target);
   if(fs.lstatSync(target).isSymbolicLink() || fs.realpathSync(target)!==target)throw new Error('清理目标或父路径有符号链接，拒绝删除。');
-  if(!target.startsWith(trustedHome()+path.sep) && !target.startsWith(path.resolve(os.tmpdir())+path.sep))throw new Error('清理目标必须位于私有 HOME 或临时目录的专用子目录。');
+  if(!underDir(target,trustedHome())&&!underDir(target,normalizedPath(path.resolve(os.tmpdir()))))throw new Error('清理目标必须位于私有 HOME 或临时目录的专用子目录。');
   const manifest=loadManifest(target);
   safeTarget(target,path.resolve(manifest.settings));
   return target;
@@ -1087,7 +1102,7 @@ async function confirmStop(target,options) {
 function stopManaged(target,context=null) {
   // 固定组件内联的停止协议。无论 manifest 如何自报 hash，绝不 source/exec 私有代码。
   const baseline=stopMetadata(target),manifest=JSON.parse(instanceFile(path.join(target,MARKER),65536).data),port=instancePort(target);
-  if(manifest?.id!=='ccr-bridge-kit'||manifest.version!==VERSION||manifest.target!==target)throw new Error('停止目标不是规范的受管理实例。');
+  if(manifest?.id!=='ccr-bridge-kit'||manifest.version!==VERSION||!samePath(manifest.target,target))throw new Error('停止目标不是规范的受管理实例。');
   const registryFile=registration.fileOf(trustedHome());
   const registry=exists(registryFile)?instanceFile(registryFile,4096).data:null;
   let startLock,serviceLock;
@@ -1138,10 +1153,10 @@ function stopManaged(target,context=null) {
       let exeReal='';try{exeReal=fs.realpathSync('/proc/'+pid+'/exe');}catch(error){if(!['ENOENT','ESRCH','EACCES'].includes(error.code))throw error;}
       const viaLinker=isSystemLinker(exeReal)&&args.length>=2;if(viaLinker)args.shift();
       let matches;
-      if(kind==='watchdog')matches=args.length===2&&path.basename(args[0])==='bash'&&args[1]===path.join(target,'watchdog.sh');
+      if(kind==='watchdog')matches=args.length===2&&path.basename(args[0])==='bash'&&samePath(args[1],path.join(target,'watchdog.sh'));
       else{
         const cli='node_modules/@musistudio/claude-code-router/dist/cli.js';
-        matches=args.length===3&&path.basename(args[0])==='node'&&args[2]==='start'&&(args[1]===path.join(target,cli)||args[1]===cli&&fs.readlinkSync('/proc/'+pid+'/cwd')===target);
+        matches=args.length===3&&path.basename(args[0])==='node'&&args[2]==='start'&&(samePath(args[1],path.join(target,cli))||args[1]===cli&&samePath(fs.readlinkSync('/proc/'+pid+'/cwd'),target));
       }
       if(!matches)return null;
       // argv[0] 可任意伪装；真实 /proc/PID/exe 必须属于固定解析的解释器。
@@ -1287,7 +1302,7 @@ function upgradeInstance(target,options,preserveDisabled=false) {
   // 只把本组件自己发过、未被改动的文件换成当前组件那份：先用内联协议停桥（不执行私有代码），
   // 逐个原子替换，最后才改 manifest；中途断掉时每个文件仍是新旧之一，下次接着做。
   const m=loadManifest(target);
-  if(m.componentEntry!==path.join(SOURCE,'component.cjs')||!exists(path.join(SOURCE,'runtime')))return false;
+  if(!samePath(m.componentEntry,path.join(SOURCE,'component.cjs'))||!exists(path.join(SOURCE,'runtime')))return false;
   const marker=path.join(target,'disabled');
   const leftover=()=>exists(marker)&&instanceFile(marker,32).data.toString('utf8')===UPGRADING;
   const probe=[];checkInstance(target,options,null,true,probe);
@@ -1324,7 +1339,7 @@ function upgradeInstance(target,options,preserveDisabled=false) {
 }
 async function manage(command,options) {
   const scoped=instanceOptions(command,options);
-  const target=path.resolve(options.dir||SOURCE);
+  const target=normalizedPath(path.resolve(options.dir||SOURCE));
   const m=loadManifest(target);
   if(scoped&&command==='ensure')upgradeInstance(target,options);
   // 卸载不执行私有代码，旧版运行文件只要未被改动就放行，免得组件升级后卸不掉
@@ -1468,4 +1483,4 @@ async function main() {
   if(cmd==='install')await install(options);else await manage(cmd,options);
 }
 if(require.main===module)main().catch(e=>{console.error('错误：'+e.message);process.exitCode=1;});
-module.exports={atomic,mergeHook,removeHook,validateConfig,routerConfig,connectionConfig,readSettings,safeTarget,hookEntry,legacyHookEntry,parse,quote,copyBundledRuntime,purgeTarget,instanceOptions,trustedHome};
+module.exports={atomic,mergeHook,removeHook,validateConfig,routerConfig,connectionConfig,readSettings,safeTarget,hookEntry,legacyHookEntry,parse,quote,copyBundledRuntime,purgeTarget,instanceOptions,trustedHome,normalizedPath,loadManifest,sameDir,underDir,insideOrSame,VERSION};

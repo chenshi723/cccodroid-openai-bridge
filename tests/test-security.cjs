@@ -97,7 +97,7 @@ async function worker(cli, fixed) {
 }
 
 async function main() {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-security-'));
+  const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-security-')));
   try {
     const env = {...process.env, HOME:path.join(temp, 'home')};
     for (const key of ['CCAPP_RUN','CLAUDECODE','CLAUDE_CODE_ENTRYPOINT','SERVICE_PORT','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy']) delete env[key];
